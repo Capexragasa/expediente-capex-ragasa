@@ -264,26 +264,20 @@ def render_step(row, n: int, is_last: bool) -> str:
         else ""
     )
 
-    return f"""
-    <div style="display:flex;gap:14px;">
-      <div style="display:flex;flex-direction:column;align-items:center;width:28px;flex-shrink:0;">
-        {circle}
-        {line}
-      </div>
-      <div style="flex:1;padding-bottom:1.5rem;">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">
-          <p style="font-weight:600;font-size:14px;margin:0;{dim}">{n}. {nombre}</p>
-          <span style="font-size:12px;color:{colors['text']};">{estatus}</span>
-        </div>
-        <p style="font-size:11.5px;color:#9a988f;margin:0 0 8px;line-height:1.4;">{descripcion}</p>
-        <div style="background:#fbfaf7;border:1px solid #eeece3;border-radius:8px;padding:8px 12px;margin-bottom:8px;">
-          {render_checklist(checks)}
-          {nota_html}
-        </div>
-        {link_html}
-      </div>
-    </div>
-    """
+    return (
+        '<div style="display:flex;gap:14px;">'
+        f'<div style="display:flex;flex-direction:column;align-items:center;width:28px;flex-shrink:0;">{circle}{line}</div>'
+        '<div style="flex:1;padding-bottom:1.5rem;">'
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">'
+        f'<p style="font-weight:600;font-size:14px;margin:0;{dim}">{n}. {nombre}</p>'
+        f'<span style="font-size:12px;color:{colors["text"]};">{estatus}</span>'
+        '</div>'
+        f'<p style="font-size:11.5px;color:#9a988f;margin:0 0 8px;line-height:1.4;">{descripcion}</p>'
+        f'<div style="background:#fbfaf7;border:1px solid #eeece3;border-radius:8px;padding:8px 12px;margin-bottom:8px;">{render_checklist(checks)}{nota_html}</div>'
+        f'{link_html}'
+        '</div>'
+        '</div>'
+    )
 
 
 def render_roadmap(row) -> None:
