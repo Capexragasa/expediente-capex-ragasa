@@ -1,10 +1,12 @@
 """
 Expediente Digital CAPEX - Ragasa
 Tablero tipo "caminito": un roadmap por proyecto con las 6 etapas del proceso
-de Compras CAPEX, su estatus real, y un enlace directo a la herramienta que
-corresponde a cada etapa. Incluye una vista de resumen general con metricas,
-una tabla filtrable de todos los proyectos, y lee los datos en vivo desde un
-Google Sheet compartido (no hace falta tener la cuenta del dueno del Sheet).
+de Compras CAPEX. Cada etapa tiene 3 checks concretos (lo que realmente hay
+que hacer) mas una nota corta opcional; el estatus (Pendiente / En proceso /
+Completo) y el % de avance se calculan solos a partir de esos checks, no se
+escriben a mano. Incluye una vista de resumen general con metricas, una tabla
+filtrable de todos los proyectos, y lee los datos en vivo desde un Google
+Sheet compartido (no hace falta tener la cuenta del dueno del Sheet).
 
 Como correrlo:
     pip install -r requirements.txt
@@ -18,12 +20,12 @@ import streamlit as st
 # CONFIGURACION
 # ---------------------------------------------------------------------------
 
-# Hoja "Expediente CAPEX - Ragasa" en Google Sheets. Compartida como
-# "Cualquiera con el enlace - Lector", asi que cualquiera que abra la app
+# Hoja "Expediente CAPEX - Ragasa (v2 checklist)" en Google Sheets. Compartida
+# como "Cualquiera con el enlace - Lector", asi que cualquiera que abra la app
 # (jefe, junior, quien sea) ve los datos reales sin necesitar la cuenta del
-# dueno del Sheet. Editar el expediente = editar esta hoja.
-SHEET_ID = "1IuxT2rnlJuR4kqStqkLQNiiS54GUAcw_F7gOHhCNj7w"
-SHEET_GID = "461307514"
+# dueno del Sheet. Marcar/desmarcar los checks = editar esta hoja.
+SHEET_ID = "1nn2_AU-jGTHOL2QuaCaHQziNMryUn2XYBE--XSJj2NA"
+SHEET_GID = "1587291527"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
 GOOGLE_SHEET_EDIT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
@@ -83,6 +85,19 @@ ETAPA_DESCRIPCIONES = {
     6: "Cerrar la decision, dar seguimiento y documentar el resultado final.",
 }
 
+# Los 3 checks concretos que definen cada etapa. El estatus y el % de avance
+# se calculan solos a partir de estos (no se escriben a mano en el Sheet).
+ETAPA_CHECKS = {
+    1: ["E1 Opciones comparadas", "E1 Equipo actual documentado", "E1 Alternativa definida"],
+    2: ["E2 Proveedores identificados", "E2 Evidencia tecnica revisada", "E2 Lista confirmada"],
+    3: ["E3 Formulario enviado", "E3 Formulario respondido", "E3 Rubrica aplicada"],
+    4: ["E4 Riesgos identificados", "E4 Mitigaciones definidas", "E4 Riesgo global calculado"],
+    5: ["E5 Cotizaciones recibidas", "E5 Comparativo hecho", "E5 Proveedor seleccionado"],
+    6: ["E6 Enviado a aprobacion", "E6 Orden generada", "E6 Cierre documentado"],
+}
+
+ETAPA_NOTA_COL = {n: f"E{n} Nota" for n in range(1, 7)}
+
 STATUS_COLORS = {
     "Completo": {"bg": "#e1f5ee", "text": "#085041", "icon": "check"},
     "En proceso": {"bg": "#faeeda", "text": "#854f0b", "icon": "clock"},
@@ -114,16 +129,48 @@ def load_data() -> pd.DataFrame:
     return df, fuente
 
 
+def parse_bool(v) -> bool:
+    """Interpreta el valor de una casilla del Sheet (TRUE/FALSE, VERDADERO/FALSO,
+    booleano real, etc.) como True/False."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().upper() in ("TRUE", "VERDADERO", "1", "SI", "SÍ", "YES")
+
+
+def check_label(col_name: str, n: int) -> str:
+    prefix = f"E{n} "
+    return col_name[len(prefix):] if col_name.startswith(prefix) else col_name
+
+
+def etapa_checks(row, n: int):
+    """Lista de (etiqueta, marcado) para los 3 checks de una etapa."""
+    return [(check_label(c, n), parse_bool(row.get(c, ""))) for c in ETAPA_CHECKS[n]]
+
+
+def etapa_status(row, n: int) -> str:
+    marcados = sum(1 for _, ok in etapa_checks(row, n) if ok)
+    if marcados == len(ETAPA_CHECKS[n]):
+        return "Completo"
+    if marcados == 0:
+        return "Pendiente"
+    return "En proceso"
+
+
+def etapas_completas(row) -> int:
+    return sum(1 for n in range(1, 7) if etapa_status(row, n) == "Completo")
+
+
 def avance_pct(row) -> float:
-    """Porcentaje de etapas marcadas como Completo (0.0 a 1.0)."""
-    completas = sum(1 for n in range(1, 7) if row.get(f"Etapa {n} Estatus", "") == "Completo")
-    return completas / 6
+    """Porcentaje de los 18 checks totales que estan marcados (0.0 a 1.0)."""
+    total = sum(1 for n in range(1, 7) for _ in ETAPA_CHECKS[n])
+    marcados = sum(1 for n in range(1, 7) for _, ok in etapa_checks(row, n) if ok)
+    return marcados / total if total else 0
 
 
 def etapa_actual(row) -> str:
     """Nombre de la primera etapa que no esta Completo (o 'Cerrado' si todas lo estan)."""
     for n in range(1, 7):
-        if row.get(f"Etapa {n} Estatus", "Pendiente") != "Completo":
+        if etapa_status(row, n) != "Completo":
             return f"{n}. {ETAPA_NOMBRES[n]}"
     return "Cerrado"
 
@@ -153,7 +200,29 @@ def render_jotform_picker() -> str:
     return cards
 
 
-def render_step(n: int, estatus: str, nota: str, is_last: bool) -> str:
+def render_checklist(checks) -> str:
+    items = ""
+    for label, ok in checks:
+        if ok:
+            mark = '<span style="color:#0a8a5f;font-weight:700;">&#10003;</span>'
+            color = "#1a1a17"
+        else:
+            mark = '<span style="color:#c9c7bc;">&#9675;</span>'
+            color = "#9a988f"
+        items += (
+            '<div style="display:flex;align-items:center;gap:7px;margin:3px 0;">'
+            f'<span style="font-size:12px;width:14px;text-align:center;">{mark}</span>'
+            f'<span style="font-size:12.5px;color:{color};">{label}</span>'
+            "</div>"
+        )
+    return items
+
+
+def render_step(row, n: int, is_last: bool) -> str:
+    estatus = etapa_status(row, n)
+    checks = etapa_checks(row, n)
+    nota = row.get(ETAPA_NOTA_COL[n], "")
+
     colors = STATUS_COLORS.get(estatus, STATUS_COLORS["Pendiente"])
     nombre = ETAPA_NOMBRES[n]
     descripcion = ETAPA_DESCRIPCIONES.get(n, "")
@@ -189,6 +258,12 @@ def render_step(n: int, estatus: str, nota: str, is_last: bool) -> str:
             f'style="font-size:13px;text-decoration:none;color:#9a988f;">{tool["label"]} &#8599;</a>'
         )
 
+    nota_html = (
+        f'<p style="font-size:12.5px;color:#5f5e5a;margin:6px 0 2px;line-height:1.5;">{nota}</p>'
+        if nota
+        else ""
+    )
+
     return f"""
     <div style="display:flex;gap:14px;">
       <div style="display:flex;flex-direction:column;align-items:center;width:28px;flex-shrink:0;">
@@ -198,10 +273,13 @@ def render_step(n: int, estatus: str, nota: str, is_last: bool) -> str:
       <div style="flex:1;padding-bottom:1.5rem;">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">
           <p style="font-weight:600;font-size:14px;margin:0;{dim}">{n}. {nombre}</p>
-          <span style="font-size:12px;color:{colors['text']};">{estatus or 'Pendiente'}</span>
+          <span style="font-size:12px;color:{colors['text']};">{estatus}</span>
         </div>
-        <p style="font-size:11.5px;color:#9a988f;margin:0 0 6px;line-height:1.4;">{descripcion}</p>
-        <p style="font-size:13px;color:#5f5e5a;margin:0 0 8px;line-height:1.5;{dim}">{nota or '-'}</p>
+        <p style="font-size:11.5px;color:#9a988f;margin:0 0 8px;line-height:1.4;">{descripcion}</p>
+        <div style="background:#fbfaf7;border:1px solid #eeece3;border-radius:8px;padding:8px 12px;margin-bottom:8px;">
+          {render_checklist(checks)}
+          {nota_html}
+        </div>
         {link_html}
       </div>
     </div>
@@ -211,6 +289,7 @@ def render_step(n: int, estatus: str, nota: str, is_last: bool) -> str:
 def render_roadmap(row) -> None:
     riesgo = row.get("Riesgo", "")
     rbg, rtext = RIESGO_COLORS.get(riesgo, ("#f1efe8", "#5f5e5a"))
+    ahorro = row.get("Ahorro Estimado", "")
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -220,13 +299,13 @@ def render_roadmap(row) -> None:
             unsafe_allow_html=True,
         )
     with col2:
+        badges = ""
         if riesgo:
-            st.markdown(
-                f"<div style='text-align:right;'><span style='background:{rbg};color:{rtext};"
-                f"font-size:12px;font-weight:600;padding:4px 12px;border-radius:8px;'>"
-                f"Riesgo {riesgo.lower()}</span></div>",
-                unsafe_allow_html=True,
+            badges += (
+                f"<span style='background:{rbg};color:{rtext};font-size:12px;font-weight:600;"
+                f"padding:4px 12px;border-radius:8px;'>Riesgo {riesgo.lower()}</span>"
             )
+        st.markdown(f"<div style='text-align:right;'>{badges}</div>", unsafe_allow_html=True)
 
     pct = avance_pct(row)
     bcol1, bcol2 = st.columns([5, 1])
@@ -234,23 +313,26 @@ def render_roadmap(row) -> None:
         st.progress(pct)
     with bcol2:
         st.markdown(
-            f"<p style='font-size:13px;color:#5f5e5a;margin:0;text-align:right;'>{int(pct * 100)}%</p>",
+            f"<p style='font-size:13px;color:#5f5e5a;margin:0;text-align:right;'>"
+            f"{etapas_completas(row)}/6 etapas &middot; {int(pct * 100)}%</p>",
             unsafe_allow_html=True,
         )
 
     proxima = row.get("Próxima Acción", "") or row.get("Proxima Accion", "")
+    info_bits = []
     if proxima:
+        info_bits.append(f"<span style='color:#5f5e5a;'>Proxima accion &mdash;</span> {proxima}")
+    if ahorro:
+        info_bits.append(f"<span style='color:#5f5e5a;'>Ahorro estimado &mdash;</span> {ahorro}")
+    if info_bits:
         st.markdown(
-            f"<div style='background:#f1efe8;border-radius:12px;padding:14px 20px;"
-            f"margin:16px 0 24px;'><span style='color:#5f5e5a;font-size:14px;'>"
-            f"Proxima accion &mdash; </span><span style='font-size:14px;'>{proxima}</span></div>",
+            "<div style='background:#f1efe8;border-radius:12px;padding:14px 20px;"
+            "margin:16px 0 24px;font-size:14px;'>" + "<br>".join(info_bits) + "</div>",
             unsafe_allow_html=True,
         )
 
     for n in range(1, 7):
-        estatus = row.get(f"Etapa {n} Estatus", "Pendiente")
-        nota = row.get(f"Etapa {n} Link", "")
-        st.markdown(render_step(n, estatus, nota, is_last=(n == 6)), unsafe_allow_html=True)
+        st.markdown(render_step(row, n, is_last=(n == 6)), unsafe_allow_html=True)
         if n == 3:
             with st.expander("Ver los 3 formularios de precalificacion", expanded=False):
                 st.markdown(render_jotform_picker(), unsafe_allow_html=True)
@@ -260,13 +342,14 @@ def render_resumen(df: pd.DataFrame) -> None:
     resumen = df.copy()
     resumen["% Avance"] = resumen.apply(avance_pct, axis=1)
     resumen["Etapa actual"] = resumen.apply(etapa_actual, axis=1)
+    resumen["Etapas completas"] = resumen.apply(lambda r: f"{etapas_completas(r)}/6", axis=1)
 
     total = len(resumen)
     avance_prom = resumen["% Avance"].mean() if total else 0
     riesgo_alto = int((resumen.get("Riesgo", "") == "Alto").sum())
     en_proceso = int(sum(
         1 for _, r in resumen.iterrows()
-        if any(r.get(f"Etapa {n} Estatus", "") == "En proceso" for n in range(1, 7))
+        if any(etapa_status(r, n) == "En proceso" for n in range(1, 7))
     ))
 
     m1, m2, m3, m4 = st.columns(4)
@@ -301,8 +384,8 @@ def render_resumen(df: pd.DataFrame) -> None:
         filtrado = filtrado[filtrado.get("Riesgo", "") == riesgo_filtro]
 
     columnas = [
-        "ID Proyecto", "Nombre del Proyecto", "Etapa actual", "% Avance",
-        "Riesgo", "Responsable", "Próxima Acción", "Última Actualización",
+        "ID Proyecto", "Nombre del Proyecto", "Etapa actual", "Etapas completas", "% Avance",
+        "Riesgo", "Ahorro Estimado", "Responsable", "Próxima Acción", "Última Actualización",
     ]
     columnas = [c for c in columnas if c in filtrado.columns]
 
@@ -348,7 +431,7 @@ df, fuente = load_data()
 if fuente == "sheet":
     st.markdown(
         f"<p style='font-size:12px;color:#5f5e5a;'>&#128260; Datos en vivo desde Google Sheets &mdash; "
-        f"<a href='{GOOGLE_SHEET_EDIT_URL}' target='_blank'>ver/editar el expediente completo &#8599;</a></p>",
+        f"<a href='{GOOGLE_SHEET_EDIT_URL}' target='_blank'>ver/marcar checks en el expediente completo &#8599;</a></p>",
         unsafe_allow_html=True,
     )
 else:
@@ -376,7 +459,9 @@ with tab_resumen:
 
 st.divider()
 st.caption(
-    "Los datos vienen de la hoja 'Expediente CAPEX - Ragasa' en Google Sheets y se refrescan "
-    "cada minuto (o al instante con 'Actualizar datos'). Para editar el estatus de un proyecto, "
-    "edita directamente esa hoja."
+    "Cada etapa tiene 3 checks concretos; el estatus (Pendiente / En proceso / Completo) y el "
+    "% de avance se calculan solos segun cuantos esten marcados. Los datos vienen de la hoja "
+    "'Expediente CAPEX - Ragasa (v2 checklist)' en Google Sheets y se refrescan cada minuto "
+    "(o al instante con 'Actualizar datos'). Para actualizar un proyecto, marca/desmarca los "
+    "checks directamente en esa hoja."
 )
