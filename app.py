@@ -3,15 +3,18 @@ Expediente Digital CAPEX - Ragasa
 Tablero tipo "caminito": un roadmap por proyecto con las 6 etapas del proceso
 de Compras CAPEX. Cada etapa tiene 3 checks concretos (lo que realmente hay
 que hacer) mas una nota corta opcional; el estatus (Pendiente / En proceso /
-Completo) y el % de avance se calculan solos a partir de esos checks, no se
-escriben a mano. Incluye una vista de resumen general con metricas, una tabla
-filtrable de todos los proyectos, y lee los datos en vivo desde un Google
-Sheet compartido (no hace falta tener la cuenta del dueno del Sheet).
+Completo), el % de avance y las alertas de proyectos sin movimiento se
+calculan solos, no se escriben a mano. Incluye un dashboard general con
+metricas, una tabla filtrable con detalle al hacer clic, y lee los datos en
+vivo desde un Google Sheet compartido (no hace falta tener la cuenta del
+dueno del Sheet).
 
 Como correrlo:
     pip install -r requirements.txt
     streamlit run app.py
 """
+
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -110,13 +113,20 @@ RIESGO_COLORS = {
     "Bajo": ("#eaf3de", "#27500a"),
 }
 
+RIESGO_EMOJI = {"Alto": "\U0001F534", "Medio": "\U0001F7E1", "Bajo": "\U0001F7E2"}
+
+# Si un proyecto abierto (no Cerrado) no se ha tocado en mas de este numero de
+# dias, se marca automaticamente como "sin movimiento" en el roadmap y en el
+# resumen, sin que nadie tenga que revisarlo a mano.
+DIAS_SIN_MOVIMIENTO_ALERTA = 5
+
 # ---------------------------------------------------------------------------
 # CARGA DE DATOS
 # ---------------------------------------------------------------------------
 
 
 @st.cache_data(ttl=60)
-def load_data() -> pd.DataFrame:
+def load_data():
     try:
         df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
         if df.empty or "ID Proyecto" not in df.columns:
@@ -126,7 +136,20 @@ def load_data() -> pd.DataFrame:
         df = pd.read_csv("sample_expediente.csv")
         fuente = "demo"
     df = df.fillna("")
-    return df, fuente
+    return df, fuente, datetime.now()
+
+
+def formatea_hace(momento: datetime) -> str:
+    segundos = max(0, int((datetime.now() - momento).total_seconds()))
+    if segundos < 5:
+        return "hace instantes"
+    if segundos < 60:
+        return f"hace {segundos} s"
+    minutos = segundos // 60
+    if minutos < 60:
+        return f"hace {minutos} min"
+    horas = minutos // 60
+    return f"hace {horas} h"
 
 
 def parse_bool(v) -> bool:
@@ -173,6 +196,31 @@ def etapa_actual(row) -> str:
         if etapa_status(row, n) != "Completo":
             return f"{n}. {ETAPA_NOMBRES[n]}"
     return "Cerrado"
+
+
+def dias_sin_actualizar(row):
+    """Dias desde 'Ultima Actualizacion'. None si el campo esta vacio o no se puede leer."""
+    val = str(row.get("Última Actualización", "")).strip()
+    if not val:
+        return None
+    try:
+        fecha = datetime.strptime(val[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (date.today() - fecha).days
+
+
+def sin_movimiento(row) -> bool:
+    if etapa_actual(row) == "Cerrado":
+        return False
+    dias = dias_sin_actualizar(row)
+    return dias is not None and dias > DIAS_SIN_MOVIMIENTO_ALERTA
+
+
+def riesgo_display(riesgo: str) -> str:
+    if not riesgo:
+        return ""
+    return f"{RIESGO_EMOJI.get(riesgo, '')} {riesgo}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +349,15 @@ def render_roadmap(row) -> None:
             )
         st.markdown(f"<div style='text-align:right;'>{badges}</div>", unsafe_allow_html=True)
 
+    if sin_movimiento(row):
+        dias = dias_sin_actualizar(row)
+        st.markdown(
+            f"<div style='background:#fcebeb;color:#791f1f;border-radius:8px;padding:8px 14px;"
+            f"margin:8px 0;font-size:13px;'>&#9888; Sin movimiento hace {dias} dias — "
+            f"conviene dar seguimiento.</div>",
+            unsafe_allow_html=True,
+        )
+
     pct = avance_pct(row)
     bcol1, bcol2 = st.columns([5, 1])
     with bcol1:
@@ -337,10 +394,14 @@ def render_resumen(df: pd.DataFrame) -> None:
     resumen["% Avance"] = resumen.apply(avance_pct, axis=1)
     resumen["Etapa actual"] = resumen.apply(etapa_actual, axis=1)
     resumen["Etapas completas"] = resumen.apply(lambda r: f"{etapas_completas(r)}/6", axis=1)
+    resumen["Sin movimiento"] = resumen.apply(sin_movimiento, axis=1)
 
     total = len(resumen)
     avance_prom = resumen["% Avance"].mean() if total else 0
-    riesgo_alto = int((resumen.get("Riesgo", "") == "Alto").sum())
+    necesitan_atencion = int(sum(
+        1 for _, r in resumen.iterrows()
+        if r.get("Riesgo", "") == "Alto" or sin_movimiento(r)
+    ))
     en_proceso = int(sum(
         1 for _, r in resumen.iterrows()
         if any(etapa_status(r, n) == "En proceso" for n in range(1, 7))
@@ -350,7 +411,7 @@ def render_resumen(df: pd.DataFrame) -> None:
     m1.metric("Proyectos", total)
     m2.metric("Avance promedio", f"{avance_prom * 100:.0f}%")
     m3.metric("En proceso activo", en_proceso)
-    m4.metric("Riesgo alto", riesgo_alto)
+    m4.metric("Necesitan atencion", necesitan_atencion, help="Riesgo alto o sin movimiento en mas de 5 dias")
 
     st.markdown("")
 
@@ -383,8 +444,14 @@ def render_resumen(df: pd.DataFrame) -> None:
     ]
     columnas = [c for c in columnas if c in filtrado.columns]
 
-    st.dataframe(
-        filtrado[columnas],
+    display_df = filtrado[columnas].copy()
+    if "Riesgo" in display_df.columns:
+        display_df["Riesgo"] = display_df["Riesgo"].apply(riesgo_display)
+    if "Sin movimiento" in filtrado.columns:
+        display_df.insert(3, "Alerta", filtrado["Sin movimiento"].apply(lambda s: "⚠ Sin mover" if s else "✅ Al dia"))
+
+    evento = st.dataframe(
+        display_df,
         column_config={
             "% Avance": st.column_config.ProgressColumn(
                 "% Avance", min_value=0, max_value=1, format="%.0f%%",
@@ -392,7 +459,28 @@ def render_resumen(df: pd.DataFrame) -> None:
         },
         hide_index=True,
         use_container_width=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="tabla_resumen",
     )
+
+    filas_sel = []
+    try:
+        filas_sel = evento.selection.rows
+    except Exception:
+        filas_sel = []
+
+    if filas_sel:
+        idx_original = filtrado.index[filas_sel[0]]
+        proyecto_sel = df.loc[idx_original]
+        st.markdown("---")
+        st.markdown(
+            f"<p style='font-size:12px;color:#9a988f;margin:0 0 8px;'>DETALLE DEL PROYECTO SELECCIONADO</p>",
+            unsafe_allow_html=True,
+        )
+        render_roadmap(proyecto_sel)
+    else:
+        st.caption("Haz clic en una fila de la tabla para ver el detalle completo del proyecto aqui mismo.")
 
     st.download_button(
         "Descargar como CSV",
@@ -420,11 +508,12 @@ with hcol2:
         st.cache_data.clear()
         st.rerun()
 
-df, fuente = load_data()
+df, fuente, cargado_en = load_data()
 
 if fuente == "sheet":
     st.markdown(
-        f"<p style='font-size:12px;color:#5f5e5a;'>&#128260; Datos en vivo desde Google Sheets &mdash; "
+        f"<p style='font-size:12px;color:#5f5e5a;'>&#128260; Datos en vivo desde Google Sheets "
+        f"(actualizados {formatea_hace(cargado_en)}) &mdash; "
         f"<a href='{GOOGLE_SHEET_EDIT_URL}' target='_blank'>ver/marcar checks en el expediente completo &#8599;</a></p>",
         unsafe_allow_html=True,
     )
@@ -439,7 +528,10 @@ if df.empty:
     st.warning("No hay proyectos cargados todavia.")
     st.stop()
 
-tab_roadmap, tab_resumen = st.tabs(["Roadmap por proyecto", "Resumen general"])
+tab_resumen, tab_roadmap = st.tabs(["Resumen general", "Roadmap por proyecto"])
+
+with tab_resumen:
+    render_resumen(df)
 
 with tab_roadmap:
     proyectos = df["ID Proyecto"] + " — " + df["Nombre del Proyecto"]
@@ -448,14 +540,12 @@ with tab_roadmap:
     row = df.loc[idx]
     render_roadmap(row)
 
-with tab_resumen:
-    render_resumen(df)
-
 st.divider()
 st.caption(
-    "Cada etapa tiene 3 checks concretos; el estatus (Pendiente / En proceso / Completo) y el "
-    "% de avance se calculan solos segun cuantos esten marcados. Los datos vienen de la hoja "
+    "Cada etapa tiene 3 checks concretos; el estatus, el % de avance y las alertas de proyectos "
+    "sin movimiento (mas de 5 dias sin actualizar) se calculan solos. Los datos vienen de la hoja "
     "'Expediente CAPEX - Ragasa (v2 checklist)' en Google Sheets y se refrescan cada minuto "
     "(o al instante con 'Actualizar datos'). Para actualizar un proyecto, marca/desmarca los "
-    "checks directamente en esa hoja."
+    "checks directamente en esa hoja — en el Resumen general puedes hacer clic en cualquier fila "
+    "para ver el detalle sin cambiar de pestaña."
 )
