@@ -286,9 +286,9 @@ def crear_expediente_desde_req(req_row) -> dict:
     return expediente
 
 def render_importador_requisiciones(df_actual: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("Importar requisición / OR")
+    st.subheader("Importar requisiciones / OR")
     st.caption(
-        "Carga el Excel de seguimiento de requisiciones. La app solo lo lee; no modifica el archivo de tus jefes."
+        "Carga el Excel de seguimiento. La app solo lo lee; no modifica el archivo de tus jefes."
     )
 
     archivo_req = st.file_uploader(
@@ -311,87 +311,185 @@ def render_importador_requisiciones(df_actual: pd.DataFrame) -> pd.DataFrame:
         return df_actual
 
     req_df = req_df.fillna("")
+    req_df["_OR"] = req_df["NO_REQ"].astype(str).str.strip()
+    req_df["_Descripcion"] = req_df.apply(construir_nombre_proyecto, axis=1)
 
-    opciones = req_df.apply(
-        lambda r: f"{normaliza_texto(r.get('NO_REQ',''))} — {construir_nombre_proyecto(r)}",
-        axis=1
-    )
-    seleccion = st.selectbox(
-        "Selecciona la requisición",
-        opciones,
-        key="selector_requisicion",
-    )
-    idx = opciones[opciones == seleccion].index[0]
-    req_row = req_df.loc[idx]
-    expediente = crear_expediente_desde_req(req_row)
+    existentes = set()
+    if "ID Proyecto" in df_actual.columns:
+        existentes = set(df_actual["ID Proyecto"].astype(str).str.strip())
 
-    st.markdown("**Vista previa del expediente CAPEX**")
-    preview_cols = [
-        "ID Proyecto",
-        "Nombre del Proyecto",
-        "Solicitante",
-        "Responsable",
-        "Proveedor inicial",
-        "Próxima Acción",
-        "Última Actualización",
-        "Dias sin convertir",
-    ]
-    preview = pd.DataFrame(
-        [{"Campo": c, "Valor": expediente.get(c, "")} for c in preview_cols]
-    )
-    st.dataframe(preview, hide_index=True, use_container_width=True)
-
-    ya_existe = (
-        "ID Proyecto" in df_actual.columns
-        and normaliza_texto(expediente["ID Proyecto"]) in set(df_actual["ID Proyecto"].astype(str).str.strip())
+    req_df["_Estado"] = req_df["_OR"].apply(
+        lambda x: "Ya existe" if x in existentes and x else "Nueva"
     )
 
-    if ya_existe:
-        st.warning("Esta requisición ya existe en el expediente actual.")
-        return df_actual
+    # Posibles duplicados por descripción similar exacta, aunque cambie la OR.
+    nombres_existentes = set()
+    if "Nombre del Proyecto" in df_actual.columns:
+        nombres_existentes = set(df_actual["Nombre del Proyecto"].astype(str).str.strip().str.lower())
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        crear = st.button(
-            "Crear expediente temporal",
+    req_df.loc[
+        (req_df["_Estado"] == "Nueva")
+        & (req_df["_Descripcion"].astype(str).str.strip().str.lower().isin(nombres_existentes)),
+        "_Estado",
+    ] = "Posible duplicado"
+
+    total = len(req_df)
+    nuevas = int((req_df["_Estado"] == "Nueva").sum())
+    ya_existen = int((req_df["_Estado"] == "Ya existe").sum())
+    posibles = int((req_df["_Estado"] == "Posible duplicado").sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("OR encontradas", total)
+    m2.metric("Nuevas", nuevas)
+    m3.metric("Ya existen", ya_existen)
+    m4.metric("Posibles duplicados", posibles)
+
+    st.markdown("### Selección")
+
+    filtro = st.radio(
+        "Mostrar",
+        ["Todas", "Solo nuevas", "Ya existen", "Posibles duplicados"],
+        horizontal=True,
+        key="filtro_importacion",
+    )
+
+    vista = req_df.copy()
+    if filtro == "Solo nuevas":
+        vista = vista[vista["_Estado"] == "Nueva"]
+    elif filtro == "Ya existen":
+        vista = vista[vista["_Estado"] == "Ya existe"]
+    elif filtro == "Posibles duplicados":
+        vista = vista[vista["_Estado"] == "Posible duplicado"]
+
+    tabla = vista[["_OR", "_Descripcion", "Responsable", "Proveedor", "_Estado"]].copy()
+    tabla.columns = ["OR", "Descripción", "Responsable", "Proveedor", "Estado"]
+
+    evento = st.dataframe(
+        tabla,
+        hide_index=True,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="multi-row",
+        key="tabla_importacion_or",
+    )
+
+    seleccionadas = []
+    try:
+        seleccionadas = evento.selection.rows
+    except Exception:
+        seleccionadas = []
+
+    st.caption(
+        "Puedes seleccionar varias filas con clic. Para importar todas las nuevas, usa el botón de abajo."
+    )
+
+    incluir_repetidas = st.checkbox(
+        "Permitir importar OR que ya existen o posibles duplicados",
+        value=False,
+        key="confirmar_duplicados",
+        help="Actívalo solo si revisaste esas OR y realmente quieres volver a crearlas.",
+    )
+
+    seleccion_df = pd.DataFrame()
+    if seleccionadas:
+        seleccion_df = vista.iloc[seleccionadas].copy()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        importar_nuevas = st.button(
+            "Preparar todas las nuevas",
             type="primary",
             use_container_width=True,
-            key="crear_expediente_temp",
-        )
-    with col_b:
-        fila_csv = pd.DataFrame([expediente]).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Descargar fila para el Sheet",
-            data=fila_csv,
-            file_name=f"expediente_{expediente['ID Proyecto']}.csv",
-            mime="text/csv",
-            use_container_width=True,
+            key="preparar_todas_nuevas",
         )
 
-    if crear:
-        st.session_state["expediente_importado"] = expediente
-        st.success(
-            "Expediente creado temporalmente en esta sesión. "
-            "Para hacerlo permanente, agrega la fila descargada al Google Sheet del roadmap."
+    with col2:
+        importar_seleccion = st.button(
+            "Preparar seleccionadas",
+            use_container_width=True,
+            key="preparar_seleccionadas",
         )
-        st.rerun()
+
+    elegidas = None
+
+    if importar_nuevas:
+        elegidas = req_df[req_df["_Estado"] == "Nueva"].copy()
+
+    elif importar_seleccion:
+        if seleccion_df.empty:
+            st.warning("Selecciona al menos una requisición.")
+            return df_actual
+
+        bloqueadas = seleccion_df[seleccion_df["_Estado"].isin(["Ya existe", "Posible duplicado"])]
+        if not bloqueadas.empty and not incluir_repetidas:
+            st.warning(
+                "Tu selección incluye OR repetidas o posibles duplicados. "
+                "Revísalas y activa la casilla de confirmación para incluirlas."
+            )
+            return df_actual
+
+        elegidas = seleccion_df.copy()
+
+    if elegidas is not None:
+        expedientes = [crear_expediente_desde_req(r) for _, r in elegidas.iterrows()]
+
+        # Guardamos varios expedientes temporalmente.
+        st.session_state["expedientes_importados"] = expedientes
+
+        # Exportar SOLO columnas que ya existen en el Google Sheet actual.
+        cols_sheet = list(df_actual.columns)
+        salida = pd.DataFrame(expedientes).reindex(columns=cols_sheet).fillna("")
+
+        st.success(f"{len(expedientes)} expediente(s) preparado(s).")
+
+        st.download_button(
+            "Descargar CSV listo para pegar al Google Sheet",
+            data=salida.to_csv(index=False).encode("utf-8-sig"),
+            file_name="expedientes_capex_importar.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="descargar_lote_importacion",
+        )
+
+        st.caption(
+            "Este archivo ya sale con las mismas columnas y en el mismo orden que tu Google Sheet actual."
+        )
 
     return df_actual
 
+
 def aplica_expediente_temporal(df_actual: pd.DataFrame) -> pd.DataFrame:
-    expediente = st.session_state.get("expediente_importado")
-    if not expediente:
+    expedientes = st.session_state.get("expedientes_importados")
+
+    # Compatibilidad con la versión anterior de un solo expediente.
+    if not expedientes:
+        uno = st.session_state.get("expediente_importado")
+        expedientes = [uno] if uno else []
+
+    if not expedientes:
         return df_actual
 
-    if "ID Proyecto" in df_actual.columns and expediente["ID Proyecto"] in set(df_actual["ID Proyecto"].astype(str)):
+    existentes = set()
+    if "ID Proyecto" in df_actual.columns:
+        existentes = set(df_actual["ID Proyecto"].astype(str).str.strip())
+
+    nuevos = []
+    for expediente in expedientes:
+        if not expediente:
+            continue
+        idp = str(expediente.get("ID Proyecto", "")).strip()
+        if idp and idp in existentes:
+            continue
+        nuevos.append(expediente)
+
+    if not nuevos:
         return df_actual
 
-    # Alinear columnas sin romper la estructura existente.
-    cols = list(dict.fromkeys(list(df_actual.columns) + list(expediente.keys())))
+    cols = list(dict.fromkeys(list(df_actual.columns) + [k for e in nuevos for k in e.keys()]))
     base = df_actual.reindex(columns=cols)
-    nueva = pd.DataFrame([expediente]).reindex(columns=cols).fillna("")
-    return pd.concat([base, nueva], ignore_index=True)
-
+    nuevas = pd.DataFrame(nuevos).reindex(columns=cols).fillna("")
+    return pd.concat([base, nuevas], ignore_index=True)
 
 # ---------------------------------------------------------------------------
 # UI HELPERS
