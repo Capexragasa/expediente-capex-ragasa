@@ -223,6 +223,176 @@ def riesgo_display(riesgo: str) -> str:
     return f"{RIESGO_EMOJI.get(riesgo, '')} {riesgo}".strip()
 
 
+
+# ---------------------------------------------------------------------------
+# IMPORTACION DE REQUISICIONES / OR
+# ---------------------------------------------------------------------------
+
+REQ_COLUMN_MAP = {
+    "NO_REQ": "ID Proyecto",
+    "Responsable": "Responsable",
+    "Comentarios": "Próxima Acción",
+    "Proveedor": "Proveedor inicial",
+    "Fecha": "Última Actualización",
+    "Dias Sin Convertir": "Dias sin convertir",
+    "USUARIO_REQ": "Solicitante",
+    "Unidad de Negocio": "Unidad de Negocio",
+    "TIPO_REQ": "Tipo requisición",
+}
+
+def normaliza_texto(v) -> str:
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
+
+def construir_nombre_proyecto(req_row) -> str:
+    p1 = normaliza_texto(req_row.get("PDDSC1", ""))
+    p2 = normaliza_texto(req_row.get("PDDSC2", ""))
+    if p1 and p2:
+        return f"{p1} - {p2}"
+    return p1 or p2 or f"Requisición {normaliza_texto(req_row.get('NO_REQ', ''))}"
+
+def crear_expediente_desde_req(req_row) -> dict:
+    expediente = {}
+
+    expediente["ID Proyecto"] = normaliza_texto(req_row.get("NO_REQ", ""))
+    expediente["Nombre del Proyecto"] = construir_nombre_proyecto(req_row)
+    expediente["Responsable"] = normaliza_texto(req_row.get("Responsable", ""))
+    expediente["Riesgo"] = ""
+    expediente["Ahorro Estimado"] = ""
+    expediente["Próxima Acción"] = normaliza_texto(req_row.get("Comentarios", ""))
+
+    fecha = normaliza_texto(req_row.get("Fecha", ""))
+    if fecha:
+        try:
+            fecha = pd.to_datetime(fecha).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    expediente["Última Actualización"] = fecha or date.today().strftime("%Y-%m-%d")
+
+    # Campos extra útiles del Excel de requisiciones.
+    expediente["Solicitante"] = normaliza_texto(req_row.get("USUARIO_REQ", ""))
+    expediente["Proveedor inicial"] = normaliza_texto(req_row.get("Proveedor", ""))
+    expediente["Dias sin convertir"] = normaliza_texto(req_row.get("Dias Sin Convertir", ""))
+    expediente["Unidad de Negocio"] = normaliza_texto(req_row.get("Unidad de Negocio", ""))
+    expediente["Tipo requisición"] = normaliza_texto(req_row.get("TIPO_REQ", ""))
+
+    # Todas las etapas inician pendientes.
+    for n in range(1, 7):
+        for col in ETAPA_CHECKS[n]:
+            expediente[col] = False
+        expediente[ETAPA_NOTA_COL[n]] = ""
+
+    return expediente
+
+def render_importador_requisiciones(df_actual: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("Importar requisición / OR")
+    st.caption(
+        "Carga el Excel de seguimiento de requisiciones. La app solo lo lee; no modifica el archivo de tus jefes."
+    )
+
+    archivo_req = st.file_uploader(
+        "Subir archivo de requisiciones",
+        type=["xlsx", "xls"],
+        key="archivo_requisiciones",
+    )
+
+    if archivo_req is None:
+        return df_actual
+
+    try:
+        req_df = pd.read_excel(archivo_req, sheet_name="Export")
+    except Exception as e:
+        st.error(f"No se pudo leer la hoja 'Export': {e}")
+        return df_actual
+
+    if "NO_REQ" not in req_df.columns:
+        st.error("No se encontró la columna NO_REQ en la hoja Export.")
+        return df_actual
+
+    req_df = req_df.fillna("")
+
+    opciones = req_df.apply(
+        lambda r: f"{normaliza_texto(r.get('NO_REQ',''))} — {construir_nombre_proyecto(r)}",
+        axis=1
+    )
+    seleccion = st.selectbox(
+        "Selecciona la requisición",
+        opciones,
+        key="selector_requisicion",
+    )
+    idx = opciones[opciones == seleccion].index[0]
+    req_row = req_df.loc[idx]
+    expediente = crear_expediente_desde_req(req_row)
+
+    st.markdown("**Vista previa del expediente CAPEX**")
+    preview_cols = [
+        "ID Proyecto",
+        "Nombre del Proyecto",
+        "Solicitante",
+        "Responsable",
+        "Proveedor inicial",
+        "Próxima Acción",
+        "Última Actualización",
+        "Dias sin convertir",
+    ]
+    preview = pd.DataFrame(
+        [{"Campo": c, "Valor": expediente.get(c, "")} for c in preview_cols]
+    )
+    st.dataframe(preview, hide_index=True, use_container_width=True)
+
+    ya_existe = (
+        "ID Proyecto" in df_actual.columns
+        and normaliza_texto(expediente["ID Proyecto"]) in set(df_actual["ID Proyecto"].astype(str).str.strip())
+    )
+
+    if ya_existe:
+        st.warning("Esta requisición ya existe en el expediente actual.")
+        return df_actual
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        crear = st.button(
+            "Crear expediente temporal",
+            type="primary",
+            use_container_width=True,
+            key="crear_expediente_temp",
+        )
+    with col_b:
+        fila_csv = pd.DataFrame([expediente]).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Descargar fila para el Sheet",
+            data=fila_csv,
+            file_name=f"expediente_{expediente['ID Proyecto']}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    if crear:
+        st.session_state["expediente_importado"] = expediente
+        st.success(
+            "Expediente creado temporalmente en esta sesión. "
+            "Para hacerlo permanente, agrega la fila descargada al Google Sheet del roadmap."
+        )
+        st.rerun()
+
+    return df_actual
+
+def aplica_expediente_temporal(df_actual: pd.DataFrame) -> pd.DataFrame:
+    expediente = st.session_state.get("expediente_importado")
+    if not expediente:
+        return df_actual
+
+    if "ID Proyecto" in df_actual.columns and expediente["ID Proyecto"] in set(df_actual["ID Proyecto"].astype(str)):
+        return df_actual
+
+    # Alinear columnas sin romper la estructura existente.
+    cols = list(dict.fromkeys(list(df_actual.columns) + list(expediente.keys())))
+    base = df_actual.reindex(columns=cols)
+    nueva = pd.DataFrame([expediente]).reindex(columns=cols).fillna("")
+    return pd.concat([base, nueva], ignore_index=True)
+
+
 # ---------------------------------------------------------------------------
 # UI HELPERS
 # ---------------------------------------------------------------------------
@@ -509,6 +679,7 @@ with hcol2:
         st.rerun()
 
 df, fuente, cargado_en = load_data()
+df = aplica_expediente_temporal(df)
 
 if fuente == "sheet":
     st.markdown(
@@ -528,7 +699,9 @@ if df.empty:
     st.warning("No hay proyectos cargados todavia.")
     st.stop()
 
-tab_resumen, tab_roadmap = st.tabs(["Resumen general", "Roadmap por proyecto"])
+tab_resumen, tab_roadmap, tab_importar = st.tabs(
+    ["Resumen general", "Roadmap por proyecto", "Importar requisición"]
+)
 
 with tab_resumen:
     render_resumen(df)
@@ -539,6 +712,9 @@ with tab_roadmap:
     idx = proyectos[proyectos == seleccion].index[0]
     row = df.loc[idx]
     render_roadmap(row)
+
+with tab_importar:
+    render_importador_requisiciones(df)
 
 st.divider()
 st.caption(
