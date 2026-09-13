@@ -528,6 +528,8 @@ def load_data():
         df = pd.read_csv("sample_expediente.csv")
         fuente = "demo"
     df = df.fillna("")
+    df["ID Proyecto"] = df["ID Proyecto"].astype(str).str.strip()
+    df = df[df["ID Proyecto"] != ""].reset_index(drop=True)
     return df, fuente, datetime.now()
 
 
