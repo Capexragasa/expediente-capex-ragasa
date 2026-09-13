@@ -9,6 +9,12 @@ metricas, una tabla filtrable con detalle al hacer clic, y lee los datos en
 vivo desde un Google Sheet compartido (no hace falta tener la cuenta del
 dueno del Sheet).
 
+Antes del paso 5 (Cotizaciones) se agrega un modulo de riesgos de mercado:
+tipo de cambio, inflacion, commodity del proyecto (historico + proyeccion
+por regresion lineal) y una referencia de mano de obra, con una
+recomendacion automatica de compra (comprar ahora / esperar / buscar
+alternativas).
+
 Como correrlo:
     pip install -r requirements.txt
     streamlit run app.py
@@ -16,7 +22,9 @@ Como correrlo:
 
 from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 # ---------------------------------------------------------------------------
@@ -119,6 +127,390 @@ RIESGO_EMOJI = {"Alto": "\U0001F534", "Medio": "\U0001F7E1", "Bajo": "\U0001F7E2
 # dias, se marca automaticamente como "sin movimiento" en el roadmap y en el
 # resumen, sin que nadie tenga que revisarlo a mano.
 DIAS_SIN_MOVIMIENTO_ALERTA = 5
+
+# ---------------------------------------------------------------------------
+# RIESGOS DE MERCADO: FX, INFLACION, COMMODITIES, MANO DE OBRA
+# ---------------------------------------------------------------------------
+# Todo esto alimenta el modulo que se muestra en el roadmap ANTES del paso 5
+# (Cotizaciones), usando las columnas "Pais Proveedor", "Commodity
+# Relacionado" y "Moneda Cotizacion" del Google Sheet. Fuentes gratuitas:
+#   - FX y commodities: Alpha Vantage (limite: 25 requests/dia en el plan
+#     gratuito -> por eso el cache es de horas, no de segundos).
+#   - Inflacion Mexico: Banxico SIE (necesita un token gratuito que se
+#     genera a mano en banxico.org.mx por un captcha; si no esta
+#     configurado, se usa Banco Mundial como respaldo).
+#   - Inflacion de otros paises: Banco Mundial (gratis, sin registro).
+#   - Mano de obra: referencia cualitativa fija (no hay una fuente publica,
+#     gratuita y en vivo para esto), claramente marcada como orientativa.
+
+
+def _get_secret(key: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+# Key gratuita de Alpha Vantage (25 requests/dia). Se puede sobreescribir
+# desde Settings -> Secrets en Streamlit Cloud con ALPHA_VANTAGE_API_KEY sin
+# tocar el codigo.
+ALPHA_VANTAGE_API_KEY = _get_secret("ALPHA_VANTAGE_API_KEY", "H3ODJAW773QN5V9W")
+ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+
+# Token de Banxico SIE (64 caracteres). Se genera en
+# https://www.banxico.org.mx/SieAPIRest/service/v1/token (requiere resolver
+# un captcha manualmente, por eso no viene precargado). Configuralo en
+# Settings -> Secrets como BANXICO_TOKEN.
+BANXICO_TOKEN = _get_secret("BANXICO_TOKEN", "")
+BANXICO_SERIE_INPC = "SP1"  # INPC general
+
+COUNTRY_INFO = {
+    "México": {"moneda": "MXN", "wb_code": "MEX"},
+    "Estados Unidos": {"moneda": "USD", "wb_code": "USA"},
+    "China": {"moneda": "CNY", "wb_code": "CHN"},
+    "Alemania": {"moneda": "EUR", "wb_code": "DEU"},
+}
+
+# Commodity (tal como aparece en el desplegable del Sheet) -> funcion de
+# Alpha Vantage. No hay endpoint directo de "acero"; para proyectos con
+# estructura/tuberia de acero se usa Cobre como proxy metalico.
+COMMODITY_AV_FUNCTION = {
+    "Cobre": "COPPER",
+    "Aluminio": "ALUMINUM",
+    "Petróleo WTI": "WTI",
+    "Petróleo Brent": "BRENT",
+    "Gas Natural": "NATURAL_GAS",
+    "Trigo": "WHEAT",
+    "Maíz": "CORN",
+    "Algodón": "COTTON",
+    "Azúcar": "SUGAR",
+    "Café": "COFFEE",
+}
+
+# Mapeo automatico proyecto -> commodity relevante, por palabras clave en el
+# nombre del proyecto. Se usa cuando la columna "Commodity Relacionado" del
+# Sheet esta vacia (o en "Otro / No aplica"), para que cualquier proyecto
+# nuevo -de hoy o futuro- se habilite solo, sin tener que configurar nada a
+# mano fila por fila.
+COMMODITY_KEYWORDS = [
+    (("tuberia", "tubería", "acero", "estructura", "estructural", "ducto"), "Cobre"),
+    (("chiller", "hvac", "aire acondicionado", "refrigeracion", "refrigeración"), "Cobre"),
+    (("banda transportadora", "transportador", "conveyor", "montacargas"), "Aluminio"),
+    (("cableado", "cable", "electrico", "eléctrico", "subestacion", "subestación"), "Cobre"),
+    (("compresor", "motor", "bomba", "maquinaria"), "Cobre"),
+    (("combustible", "diesel", "diésel", "caldera"), "Gas Natural"),
+    (("empaque", "embalaje", "textil"), "Algodón"),
+]
+
+# Referencia cualitativa de costo de mano de obra industrial por pais del
+# proveedor. No es un dato en vivo (no encontramos una fuente publica y
+# gratuita de series salariales por pais con API estable): es una nota de
+# contexto para el comprador, marcada como tal en la UI.
+LABOR_COST_REF = {
+    "México": "Bajo-medio frente a EUA y Alemania (ventaja historica de manufactura en Mexico).",
+    "Estados Unidos": "Alto; presiones salariales sostenidas en manufactura desde 2021.",
+    "China": "Medio, en aumento sostenido en la ultima decada (ya no es 'mano de obra barata').",
+    "Alemania": "Muy alto; de los costos laborales industriales mas altos del mundo.",
+}
+
+
+def sugerir_commodity(nombre_proyecto: str):
+    """Devuelve (commodity, fue_automatico) a partir del nombre del proyecto."""
+    texto = str(nombre_proyecto or "").lower()
+    for keywords, commodity in COMMODITY_KEYWORDS:
+        if any(k in texto for k in keywords):
+            return commodity, True
+    return "Cobre", True  # generico por defecto, tambien marcado como automatico
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def av_fx_rate(from_ccy: str, to_ccy: str):
+    """Tipo de cambio actual entre dos monedas via Alpha Vantage."""
+    if not from_ccy or not to_ccy or from_ccy == to_ccy:
+        return None
+    try:
+        params = {
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": from_ccy,
+            "to_currency": to_ccy,
+            "apikey": ALPHA_VANTAGE_API_KEY,
+        }
+        r = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
+        data = r.json().get("Realtime Currency Exchange Rate", {})
+        if not data:
+            return None
+        return {
+            "rate": float(data.get("5. Exchange Rate", 0)),
+            "fecha": data.get("6. Last Refreshed", ""),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def av_commodity_series(commodity: str):
+    """Serie mensual historica (ultimos ~24 meses) de un commodity via Alpha Vantage."""
+    func = COMMODITY_AV_FUNCTION.get(commodity)
+    if not func:
+        return None
+    try:
+        params = {"function": func, "interval": "monthly", "apikey": ALPHA_VANTAGE_API_KEY}
+        r = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
+        data = r.json().get("data", [])
+        serie = [
+            (d["date"], float(d["value"]))
+            for d in data
+            if d.get("value") not in (None, ".", "")
+        ]
+        serie.sort(key=lambda x: x[0])
+        return serie[-24:]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def banxico_inpc_series():
+    """Ultimos 13 meses del INPC general (Mexico) via Banxico SIE, si hay token."""
+    if not BANXICO_TOKEN:
+        return None
+    try:
+        url = f"https://www.banxico.org.mx/SieAPIRest/service/v1/series/{BANXICO_SERIE_INPC}/datos"
+        r = requests.get(url, headers={"Bmx-Token": BANXICO_TOKEN}, timeout=10)
+        datos = r.json()["bmx"]["series"][0]["datos"]
+        serie = [(d["fecha"], float(str(d["dato"]).replace(",", ""))) for d in datos]
+        return serie[-13:]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def world_bank_inflation(wb_code: str):
+    """Inflacion anual (precios al consumidor) mas reciente disponible, Banco Mundial."""
+    if not wb_code:
+        return None
+    try:
+        url = f"https://api.worldbank.org/v2/country/{wb_code}/indicator/FP.CPI.TOTL.ZG?format=json&per_page=10"
+        r = requests.get(url, timeout=10)
+        datos = r.json()[1]
+        for d in datos:
+            if d.get("value") is not None:
+                return {"valor": float(d["value"]), "anio": d["date"]}
+        return None
+    except Exception:
+        return None
+
+
+def regresion_lineal_commodity(serie):
+    """Regresion lineal simple sobre el historico de un commodity.
+
+    serie: lista de (fecha_str, valor) ordenada cronologicamente.
+    Devuelve un dict con el nivel actual, el promedio de 12 meses, la
+    proyeccion a 3 meses y las variaciones porcentuales que alimentan la
+    recomendacion de compra.
+    """
+    if not serie or len(serie) < 4:
+        return None
+    valores = np.array([v for _, v in serie], dtype=float)
+    x = np.arange(len(valores))
+    pendiente, intercepto = np.polyfit(x, valores, 1)
+    proyeccion_x = len(valores) + 2  # ~3 meses adelante (0-based)
+    proyeccion = pendiente * proyeccion_x + intercepto
+    actual = float(valores[-1])
+    promedio_12m = float(valores[-12:].mean()) if len(valores) >= 12 else float(valores.mean())
+    tendencia_pct = ((proyeccion - actual) / actual * 100) if actual else 0.0
+    nivel_pct = ((actual - promedio_12m) / promedio_12m * 100) if promedio_12m else 0.0
+    return {
+        "actual": actual,
+        "promedio_12m": promedio_12m,
+        "proyeccion_3m": float(proyeccion),
+        "tendencia_pct": float(tendencia_pct),
+        "nivel_pct": float(nivel_pct),
+        "fechas": [f for f, _ in serie],
+        "valores": valores.tolist(),
+    }
+
+
+def recomendacion_compra(analisis):
+    """Recomendacion de compra en 3 sabores: comprar ahora / esperar / buscar
+    alternativas, a partir de la regresion lineal del commodity."""
+    if not analisis:
+        return (
+            "Sin datos suficientes",
+            "Se necesitan por lo menos 4 meses de historico del commodity para estimar una tendencia.",
+        )
+    tendencia = analisis["tendencia_pct"]
+    nivel = analisis["nivel_pct"]
+    if nivel > 15:
+        return (
+            "Buscar alternativas / negociar",
+            f"El precio actual esta {nivel:.1f}% por encima de su promedio de 12 meses; conviene "
+            "negociar o explorar proveedores/commodities sustitutos antes de comprar.",
+        )
+    if tendencia > 5:
+        return (
+            "Comprar ahora",
+            f"La proyeccion a 3 meses (regresion lineal sobre el historico) sugiere un alza de "
+            f"{tendencia:.1f}%; conviene cerrar la compra antes de que suba mas.",
+        )
+    if tendencia < -5:
+        return (
+            "Esperar",
+            f"La proyeccion a 3 meses sugiere una baja de {abs(tendencia):.1f}%; conviene esperar "
+            "un poco si el cronograma del proyecto lo permite.",
+        )
+    return (
+        "Proceder segun cronograma",
+        "El precio se mantiene relativamente estable (sin tendencia fuerte ni nivel inusual); no "
+        "hay una senal de mercado que justifique adelantar o atrasar la compra.",
+    )
+
+
+def render_riesgo_mercado(row) -> None:
+    """Modulo de riesgos de mercado (FX, inflacion, commodity, mano de obra),
+    con recomendacion automatica. Se muestra en el roadmap justo antes del
+    paso 5 (Cotizaciones)."""
+
+    st.markdown(
+        "<p style='font-weight:600;font-size:14px;margin:10px 0 2px;'>"
+        "&#128225; Riesgos de mercado antes de cotizar: commodities, tipo de cambio e inflacion</p>"
+        "<p style='font-size:11.5px;color:#9a988f;margin:0 0 10px;line-height:1.4;'>"
+        "Insight automatico previo al paso 5: commodity del proyecto, tipo de cambio, inflacion "
+        "y mano de obra del pais del proveedor.</p>",
+        unsafe_allow_html=True,
+    )
+
+    pais_proveedor = str(row.get("País Proveedor", "") or row.get("Pais Proveedor", "")).strip()
+    commodity_sheet = str(row.get("Commodity Relacionado", "")).strip()
+    moneda_cotizacion = str(row.get("Moneda Cotización", "") or row.get("Moneda Cotizacion", "")).strip()
+
+    if commodity_sheet and commodity_sheet not in ("Otro / No aplica", "Otro"):
+        commodity, commodity_auto = commodity_sheet, False
+    else:
+        commodity, commodity_auto = sugerir_commodity(row.get("Nombre del Proyecto", ""))
+
+    st.markdown(
+        "<div style='background:#fbfaf7;border:1px solid #eeece3;border-radius:10px;"
+        "padding:14px 18px 6px;margin-bottom:10px;'>",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        etiqueta_commodity = commodity + (" (auto)" if commodity_auto else "")
+        st.markdown(f"**Commodity**<br>{etiqueta_commodity}", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"**Pais proveedor**<br>{pais_proveedor or 'No especificado'}", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"**Moneda cotizacion**<br>{moneda_cotizacion or 'No especificada'}", unsafe_allow_html=True)
+
+    if not pais_proveedor:
+        st.caption(
+            "Completa 'País Proveedor', 'Commodity Relacionado' y 'Moneda Cotización' en el "
+            "Google Sheet para un analisis mas preciso de este proyecto."
+        )
+
+    info_pais = COUNTRY_INFO.get(pais_proveedor)
+
+    # --- Tipo de cambio -----------------------------------------------------
+    st.markdown("**Tipo de cambio**")
+    if pais_proveedor == "México":
+        st.caption("Proveedor nacional (Mexico) — sin riesgo cambiario directo en la compra.")
+    elif info_pais:
+        moneda_prov = info_pais["moneda"]
+        fx_prov_usd = av_fx_rate(moneda_prov, "USD")
+        fx_usd_mxn = av_fx_rate("USD", "MXN")
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            if fx_prov_usd:
+                st.metric(f"{moneda_prov}/USD", f"{fx_prov_usd['rate']:.4f}")
+            else:
+                st.caption(f"No se pudo obtener {moneda_prov}/USD (limite de API o dato no disponible).")
+        with fcol2:
+            if fx_usd_mxn:
+                st.metric("USD/MXN", f"{fx_usd_mxn['rate']:.4f}")
+            else:
+                st.caption("No se pudo obtener USD/MXN (limite de API o dato no disponible).")
+    else:
+        st.caption("Especifica el pais del proveedor para calcular el tipo de cambio relevante.")
+
+    # --- Inflacion ------------------------------------------------------------
+    st.markdown("**Inflacion**")
+    if pais_proveedor == "México":
+        serie_inpc = banxico_inpc_series()
+        if serie_inpc and len(serie_inpc) >= 13:
+            inflacion_yoy = (serie_inpc[-1][1] / serie_inpc[0][1] - 1) * 100
+            st.metric("Inflacion Mexico (INPC, interanual)", f"{inflacion_yoy:.1f}%")
+            st.caption("Fuente: Banxico SIE.")
+        else:
+            wb = world_bank_inflation("MEX")
+            if wb:
+                st.metric(f"Inflacion Mexico ({wb['anio']})", f"{wb['valor']:.1f}%")
+                st.caption(
+                    "Fuente: Banco Mundial (agrega tu token de Banxico en Secrets como "
+                    "BANXICO_TOKEN para el dato interanual mas reciente)."
+                )
+            else:
+                st.caption("No se pudo obtener la inflacion de Mexico en este momento.")
+    elif info_pais:
+        wb = world_bank_inflation(info_pais["wb_code"])
+        if wb:
+            st.metric(f"Inflacion {pais_proveedor} ({wb['anio']})", f"{wb['valor']:.1f}%")
+            st.caption("Fuente: Banco Mundial.")
+        else:
+            st.caption(f"No se pudo obtener la inflacion de {pais_proveedor} en este momento.")
+    else:
+        st.caption("Especifica el pais del proveedor para ver su inflacion.")
+
+    # --- Commodity: historico, proyeccion y recomendacion --------------------
+    st.markdown("**Commodity — historico, proyeccion y recomendacion**")
+    serie_commodity = av_commodity_series(commodity)
+    analisis = regresion_lineal_commodity(serie_commodity) if serie_commodity else None
+
+    if analisis:
+        chart_df = pd.DataFrame(
+            {"Precio": analisis["valores"]},
+            index=pd.to_datetime(analisis["fechas"]),
+        )
+        st.line_chart(chart_df, height=180)
+
+        mcol1, mcol2, mcol3 = st.columns(3)
+        mcol1.metric("Precio actual", f"{analisis['actual']:.2f}")
+        mcol2.metric("Promedio 12m", f"{analisis['promedio_12m']:.2f}")
+        mcol3.metric(
+            "Proyeccion 3m (regresion lineal)",
+            f"{analisis['proyeccion_3m']:.2f}",
+            f"{analisis['tendencia_pct']:+.1f}%",
+        )
+
+        veredicto, motivo = recomendacion_compra(analisis)
+        color_map = {
+            "Comprar ahora": ("#eaf3de", "#27500a"),
+            "Esperar": ("#faeeda", "#854f0b"),
+            "Buscar alternativas / negociar": ("#fcebeb", "#791f1f"),
+            "Proceder segun cronograma": ("#f1efe8", "#5f5e5a"),
+        }
+        bg, txt = color_map.get(veredicto, ("#f1efe8", "#5f5e5a"))
+        st.markdown(
+            f"<div style='background:{bg};color:{txt};border-radius:8px;padding:10px 14px;"
+            f"margin:8px 0;font-size:13px;'><strong>{veredicto}</strong><br>{motivo}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(
+            "No se pudo obtener el historico de este commodity en este momento (limite diario "
+            "de la API gratuita o dato no disponible)."
+        )
+
+    # --- Mano de obra ----------------------------------------------------------
+    st.markdown("**Referencia de mano de obra (proveedor)**")
+    ref_mano_obra = LABOR_COST_REF.get(pais_proveedor)
+    if ref_mano_obra:
+        st.caption(f"{pais_proveedor}: {ref_mano_obra} (referencia orientativa, no en tiempo real).")
+    else:
+        st.caption("Sin referencia de mano de obra para este pais (indicador orientativo, no en tiempo real).")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ---------------------------------------------------------------------------
 # CARGA DE DATOS
@@ -655,6 +1047,8 @@ def render_roadmap(row) -> None:
         if n == 3:
             with st.expander("Ver los 3 formularios de precalificacion", expanded=False):
                 st.markdown(render_jotform_picker(), unsafe_allow_html=True)
+        if n == 4:
+            render_riesgo_mercado(row)
 
 
 def render_resumen(df: pd.DataFrame) -> None:
@@ -821,5 +1215,8 @@ st.caption(
     "'Expediente CAPEX - Ragasa (v2 checklist)' en Google Sheets y se refrescan cada minuto "
     "(o al instante con 'Actualizar datos'). Para actualizar un proyecto, marca/desmarca los "
     "checks directamente en esa hoja — en el Resumen general puedes hacer clic en cualquier fila "
-    "para ver el detalle sin cambiar de pestaña."
+    "para ver el detalle sin cambiar de pestaña. El bloque de riesgos de mercado (antes del paso "
+    "5) usa Alpha Vantage para tipo de cambio y commodities, y Banxico/Banco Mundial para "
+    "inflacion; son fuentes gratuitas con limites de uso, por lo que los datos se cachean por "
+    "horas."
 )
