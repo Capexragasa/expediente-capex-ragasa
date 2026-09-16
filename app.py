@@ -20,6 +20,7 @@ Como correrlo:
     streamlit run app.py
 """
 
+import re
 from datetime import date, datetime
 
 import numpy as np
@@ -187,20 +188,97 @@ COMMODITY_AV_FUNCTION = {
     "Café": "COFFEE",
 }
 
-# Mapeo automatico proyecto -> commodity relevante, por palabras clave en el
-# nombre del proyecto. Se usa cuando la columna "Commodity Relacionado" del
-# Sheet esta vacia (o en "Otro / No aplica"), para que cualquier proyecto
-# nuevo -de hoy o futuro- se habilite solo, sin tener que configurar nada a
-# mano fila por fila.
-COMMODITY_KEYWORDS = [
-    (("tuberia", "tubería", "acero", "estructura", "estructural", "ducto"), "Cobre"),
-    (("chiller", "hvac", "aire acondicionado", "refrigeracion", "refrigeración"), "Cobre"),
-    (("banda transportadora", "transportador", "conveyor", "montacargas"), "Aluminio"),
-    (("cableado", "cable", "electrico", "eléctrico", "subestacion", "subestación"), "Cobre"),
-    (("compresor", "motor", "bomba", "maquinaria"), "Cobre"),
-    (("combustible", "diesel", "diésel", "caldera"), "Gas Natural"),
-    (("empaque", "embalaje", "textil"), "Algodón"),
-]
+# Mapeo automatico proyecto -> commodity(s) relevante(s), por palabras clave en
+# el nombre/descripcion del proyecto. Se usa cuando la columna "Commodity
+# Relacionado" del Sheet esta vacia (o en "Otro / No aplica"), para que
+# cualquier proyecto nuevo -de hoy o futuro- se habilite solo, sin tener que
+# configurar nada a mano fila por fila. A diferencia de la version anterior,
+# aqui se pueden detectar VARIOS commodities relevantes a la vez (ej. un
+# generador electrico usa cobre Y acero Y aluminio), cada uno con un nivel de
+# relevancia, en vez de quedarse con el primero que matchee.
+RELEVANCIA_RANK = {"Alta": 3, "Media": 2, "Baja": 1}
+
+COMMODITY_KEYWORD_MAP = {
+    # Cobre: bobinados, cableado, motores/generadores, subestaciones.
+    "cobre": ("Cobre", "Alta"),
+    "cableado": ("Cobre", "Alta"),
+    "cable": ("Cobre", "Media"),
+    "bobina": ("Cobre", "Alta"),
+    "bobinas": ("Cobre", "Alta"),
+    "devanado": ("Cobre", "Alta"),
+    "devanados": ("Cobre", "Alta"),
+    "alternador": ("Cobre", "Alta"),
+    "generador": ("Cobre", "Alta"),
+    "electrico": ("Cobre", "Media"),
+    "electrica": ("Cobre", "Media"),
+    "subestacion": ("Cobre", "Alta"),
+    "motor": ("Cobre", "Media"),
+    "compresor": ("Cobre", "Media"),
+    "bomba": ("Cobre", "Media"),
+    "chiller": ("Cobre", "Media"),
+    "hvac": ("Cobre", "Media"),
+    "aire acondicionado": ("Cobre", "Media"),
+    "refrigeracion": ("Cobre", "Media"),
+    "maquinaria": ("Cobre", "Baja"),
+    # Acero: sin indice de materia prima directo en las fuentes gratuitas
+    # aprobadas (Alpha Vantage no tiene STEEL). Se detecta y se muestra como
+    # driver, pero se marca explicitamente sin dato en vivo (no se usa cobre
+    # disfrazado de acero).
+    "acero": ("Acero", "Alta"),
+    "estructura": ("Acero", "Alta"),
+    "estructural": ("Acero", "Alta"),
+    "chasis": ("Acero", "Media"),
+    "carcasa": ("Acero", "Media"),
+    "tuberia": ("Acero", "Media"),
+    "ducto": ("Acero", "Media"),
+    # Aluminio
+    "aluminio": ("Aluminio", "Alta"),
+    "banda transportadora": ("Aluminio", "Media"),
+    "transportador": ("Aluminio", "Media"),
+    "conveyor": ("Aluminio", "Media"),
+    "montacargas": ("Aluminio", "Baja"),
+    "disipacion": ("Aluminio", "Media"),
+    # Energia / combustibles
+    "combustible": ("Gas Natural", "Alta"),
+    "diesel": ("Gas Natural", "Media"),
+    "caldera": ("Gas Natural", "Alta"),
+    "gas natural": ("Gas Natural", "Alta"),
+    "petroleo": ("Petróleo WTI", "Alta"),
+    # Textil / empaque
+    "empaque": ("Algodón", "Media"),
+    "embalaje": ("Algodón", "Media"),
+    "textil": ("Algodón", "Alta"),
+}
+
+
+def _normaliza_busqueda(texto: str) -> str:
+    """minusculas y sin acentos, para que las palabras clave matcheen sin
+    importar si el texto original trae o no tildes."""
+    import unicodedata
+
+    texto = str(texto or "").lower()
+    nfkd = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def detectar_commodities(texto: str):
+    """Devuelve (lista_commodities, fue_generico).
+
+    lista_commodities es [(commodity, relevancia), ...] ordenada de mayor a
+    menor relevancia, sin duplicar commodity (se queda con la relevancia mas
+    alta encontrada para cada uno). Si no matchea nada, regresa Cobre como
+    generico por defecto y fue_generico=True."""
+    texto_norm = _normaliza_busqueda(texto)
+    encontrados = {}
+    for kw, (commodity, relevancia) in COMMODITY_KEYWORD_MAP.items():
+        if kw in texto_norm:
+            actual = encontrados.get(commodity)
+            if not actual or RELEVANCIA_RANK[relevancia] > RELEVANCIA_RANK[actual]:
+                encontrados[commodity] = relevancia
+    if not encontrados:
+        return [("Cobre", "Media")], True
+    ordenado = sorted(encontrados.items(), key=lambda kv: -RELEVANCIA_RANK[kv[1]])
+    return ordenado, False
 
 # Referencia cualitativa de costo de mano de obra industrial por pais del
 # proveedor. No es un dato en vivo (no encontramos una fuente publica y
@@ -212,15 +290,6 @@ LABOR_COST_REF = {
     "China": "Medio, en aumento sostenido en la ultima decada (ya no es 'mano de obra barata').",
     "Alemania": "Muy alto; de los costos laborales industriales mas altos del mundo.",
 }
-
-
-def sugerir_commodity(nombre_proyecto: str):
-    """Devuelve (commodity, fue_automatico) a partir del nombre del proyecto."""
-    texto = str(nombre_proyecto or "").lower()
-    for keywords, commodity in COMMODITY_KEYWORDS:
-        if any(k in texto for k in keywords):
-            return commodity, True
-    return "Cobre", True  # generico por defecto, tambien marcado como automatico
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
@@ -365,6 +434,142 @@ def recomendacion_compra(analisis):
     )
 
 
+RIESGO_NIVEL_RANK = {"Bajo": 1, "Medio": 2, "Medio-Alto": 3, "Alto": 4}
+RIESGO_NIVEL_STYLE = {
+    "Bajo": ("#eaf3de", "#27500a", "\U0001F7E2"),
+    "Medio": ("#faeeda", "#854f0b", "\U0001F7E1"),
+    "Medio-Alto": ("#fbe4d5", "#7a3b12", "\U0001F7E1\U0001F534"),
+    "Alto": ("#fcebeb", "#791f1f", "\U0001F534"),
+}
+
+
+def clasificar_riesgo_commodity(analisis) -> str:
+    """Nivel de riesgo del commodity a partir de la regresion (nivel vs
+    promedio 12m y tendencia proyectada). Mismos umbrales que
+    recomendacion_compra, para que ambas lecturas sean consistentes."""
+    if not analisis:
+        return "Medio"
+    nivel = abs(analisis["nivel_pct"])
+    tendencia = abs(analisis["tendencia_pct"])
+    if nivel > 20 or tendencia > 15:
+        return "Alto"
+    if nivel > 10 or tendencia > 8:
+        return "Medio-Alto"
+    if nivel > 3 or tendencia > 3:
+        return "Medio"
+    return "Bajo"
+
+
+def clasificar_riesgo_inflacion(valor_pct) -> str:
+    """Heuristica simple sobre inflacion anual (no es un estandar oficial,
+    solo para dar una referencia visual consistente)."""
+    if valor_pct is None:
+        return "Medio"
+    v = abs(valor_pct)
+    if v > 6:
+        return "Alto"
+    if v > 4:
+        return "Medio-Alto"
+    if v > 2.5:
+        return "Medio"
+    return "Bajo"
+
+
+def clasificar_riesgo_cambiario(hay_exposicion: bool, cobertura: bool = False) -> str:
+    if not hay_exposicion:
+        return "Bajo"
+    return "Medio" if cobertura else "Alto"
+
+
+def combinar_riesgo(niveles) -> str:
+    """El riesgo combinado es el nivel mas alto entre los que se le pasen
+    (no un promedio): una sola variable muy expuesta ya es motivo de
+    atencion aunque las demas esten tranquilas."""
+    niveles = [n for n in niveles if n]
+    if not niveles:
+        return "Medio"
+    return max(niveles, key=lambda n: RIESGO_NIVEL_RANK.get(n, 2))
+
+
+def badge_riesgo_html(nivel: str) -> str:
+    bg, txt, emoji = RIESGO_NIVEL_STYLE.get(nivel, RIESGO_NIVEL_STYLE["Medio"])
+    return (
+        f"<span style='background:{bg};color:{txt};font-size:12px;font-weight:600;"
+        f"padding:2px 10px;border-radius:6px;white-space:nowrap;'>{emoji} {nivel}</span>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PARSER DE DESCRIPCION LIBRE (para "Nueva solicitud")
+# ---------------------------------------------------------------------------
+# Extrae de un texto libre (titulo + descripcion de la solicitud, con el
+# formato que normalmente ya se comparte: proveedor, pais, monedas, monto,
+# fechas, condiciones de pago) los datos estructurados que antes habia que
+# capturar a mano en el Sheet. Si un dato no aparece en el texto, se deja
+# vacio -no se inventa- igual que hace el resto de la app.
+
+
+def parsear_descripcion_libre(texto: str) -> dict:
+    t = str(texto or "")
+
+    def buscar(patrones):
+        for p in patrones:
+            m = re.search(p, t, re.IGNORECASE)
+            if m:
+                return m.group(1).strip().rstrip(".").strip()
+        return ""
+
+    datos = {}
+    datos["proveedor"] = buscar([
+        r"proveedor:\s*([^\n]+)",
+    ])
+    datos["pais"] = buscar([
+        r"pa[ií]s de fabricaci[oó]n:\s*([^\n\.]+)",
+        r"pa[ií]s (?:del )?proveedor:\s*([^\n\.]+)",
+        r"pa[ií]s:\s*([^\n\.]+)",
+    ])
+    datos["moneda_cotizacion"] = buscar([
+        r"moneda de cotizaci[oó]n:\s*([A-Za-z]{3})",
+        r"moneda cotizaci[oó]n:\s*([A-Za-z]{3})",
+    ]).upper()
+    datos["moneda_presupuesto"] = buscar([
+        r"moneda presupuestal:\s*([A-Za-z]{3})",
+        r"moneda (?:de )?presupuesto:\s*([A-Za-z]{3})",
+    ]).upper()
+
+    m_monto = re.search(r"monto\s*(?:cotizado)?:?\s*([\d,\.]+)\s*([A-Za-z]{3})", t, re.IGNORECASE)
+    if m_monto:
+        try:
+            datos["monto"] = float(m_monto.group(1).replace(",", ""))
+        except ValueError:
+            datos["monto"] = None
+        datos["moneda_monto"] = m_monto.group(2).upper()
+    else:
+        datos["monto"] = None
+        datos["moneda_monto"] = ""
+
+    datos["fecha_cotizacion"] = buscar([r"fecha de cotizaci[oó]n:\s*([^\n\.]+)"])
+    datos["fecha_compra"] = buscar([r"compra estimada:\s*([^\n\.]+)"])
+    datos["fecha_entrega"] = buscar([r"entrega requerida:\s*([^\n\.]+)"])
+    datos["vigencia"] = buscar([r"vigencia hasta\s*([^\n\.]+)"])
+
+    pagos = []
+    for m in re.finditer(
+        r"(\d{1,3})\s*%\s*(anticipo|al iniciar[^\n\.,]*|inicio[^\n\.,]*|contra entrega|entrega)",
+        t,
+        re.IGNORECASE,
+    ):
+        pagos.append({"pct": int(m.group(1)), "momento": m.group(2).strip()})
+    datos["pagos"] = pagos
+
+    datos["sin_cobertura"] = bool(re.search(r"no existe cobertura|sin cobertura", t, re.IGNORECASE))
+    datos["con_cobertura"] = bool(
+        re.search(r"\bcobertura\b", t, re.IGNORECASE)
+    ) and not datos["sin_cobertura"]
+
+    return datos
+
+
 def render_riesgo_mercado(row) -> None:
     """Modulo de riesgos de mercado (FX, inflacion, commodity, mano de obra),
     con recomendacion automatica. Se muestra en el roadmap justo antes del
@@ -382,11 +587,16 @@ def render_riesgo_mercado(row) -> None:
     pais_proveedor = str(row.get("País Proveedor", "") or row.get("Pais Proveedor", "")).strip()
     commodity_sheet = str(row.get("Commodity Relacionado", "")).strip()
     moneda_cotizacion = str(row.get("Moneda Cotización", "") or row.get("Moneda Cotizacion", "")).strip()
+    descripcion_extra = str(row.get("Descripción", "") or row.get("Descripcion", ""))
 
     if commodity_sheet and commodity_sheet not in ("Otro / No aplica", "Otro"):
-        commodity, commodity_auto = commodity_sheet, False
+        commodities = [(commodity_sheet, "Alta")]
+        commodity_auto = False
     else:
-        commodity, commodity_auto = sugerir_commodity(row.get("Nombre del Proyecto", ""))
+        texto_deteccion = f"{row.get('Nombre del Proyecto', '')} {descripcion_extra}"
+        commodities, commodity_auto = detectar_commodities(texto_deteccion)
+
+    commodity = commodities[0][0]  # el de mayor relevancia es el que se grafica a detalle
 
     st.markdown(
         "<div style='background:#fbfaf7;border:1px solid #eeece3;border-radius:10px;"
@@ -394,10 +604,18 @@ def render_riesgo_mercado(row) -> None:
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        etiqueta_commodity = commodity + (" (auto)" if commodity_auto else "")
-        st.markdown(f"**Commodity**<br>{etiqueta_commodity}", unsafe_allow_html=True)
+    if len(commodities) > 1:
+        etiquetas = ", ".join(f"{c} ({r})" for c, r in commodities)
+        st.markdown(
+            f"**Commodities relevantes**{' (auto)' if commodity_auto else ''}<br>{etiquetas}",
+            unsafe_allow_html=True,
+        )
+        c2, c3 = st.columns(2)
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            etiqueta_commodity = commodity + (" (auto)" if commodity_auto else "")
+            st.markdown(f"**Commodity**<br>{etiqueta_commodity}", unsafe_allow_html=True)
     with c2:
         st.markdown(f"**Pais proveedor**<br>{pais_proveedor or 'No especificado'}", unsafe_allow_html=True)
     with c3:
@@ -417,19 +635,29 @@ def render_riesgo_mercado(row) -> None:
         st.caption("Proveedor nacional (Mexico) — sin riesgo cambiario directo en la compra.")
     elif info_pais:
         moneda_prov = info_pais["moneda"]
-        fx_prov_usd = av_fx_rate(moneda_prov, "USD")
-        fx_usd_mxn = av_fx_rate("USD", "MXN")
-        fcol1, fcol2 = st.columns(2)
-        with fcol1:
-            if fx_prov_usd:
-                st.metric(f"{moneda_prov}/USD", f"{fx_prov_usd['rate']:.4f}")
-            else:
-                st.caption(f"No se pudo obtener {moneda_prov}/USD (limite de API o dato no disponible).")
-        with fcol2:
+        if moneda_prov == "USD":
+            # Proveedor ya cotiza en USD: el unico tramo relevante hacia el
+            # presupuesto (asumido en MXN) es USD/MXN, no hace falta (ni
+            # tiene sentido) mostrar USD/USD.
+            fx_usd_mxn = av_fx_rate("USD", "MXN")
             if fx_usd_mxn:
                 st.metric("USD/MXN", f"{fx_usd_mxn['rate']:.4f}")
             else:
                 st.caption("No se pudo obtener USD/MXN (limite de API o dato no disponible).")
+        else:
+            fx_prov_usd = av_fx_rate(moneda_prov, "USD")
+            fx_usd_mxn = av_fx_rate("USD", "MXN")
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                if fx_prov_usd:
+                    st.metric(f"{moneda_prov}/USD", f"{fx_prov_usd['rate']:.4f}")
+                else:
+                    st.caption(f"No se pudo obtener {moneda_prov}/USD (limite de API o dato no disponible).")
+            with fcol2:
+                if fx_usd_mxn:
+                    st.metric("USD/MXN", f"{fx_usd_mxn['rate']:.4f}")
+                else:
+                    st.caption("No se pudo obtener USD/MXN (limite de API o dato no disponible).")
     else:
         st.caption("Especifica el pais del proveedor para calcular el tipo de cambio relevante.")
 
@@ -462,43 +690,69 @@ def render_riesgo_mercado(row) -> None:
         st.caption("Especifica el pais del proveedor para ver su inflacion.")
 
     # --- Commodity: historico, proyeccion y recomendacion --------------------
+    # Se muestra el detalle (grafica + regresion) del commodity de mayor
+    # relevancia que SI tenga indice directo en Alpha Vantage. Los demas
+    # commodities detectados (ej. Acero, sin fuente gratuita directa) se
+    # listan como referencia, sin inventarles un precio.
     st.markdown("**Commodity — historico, proyeccion y recomendacion**")
-    serie_commodity = av_commodity_series(commodity)
-    analisis = regresion_lineal_commodity(serie_commodity) if serie_commodity else None
 
-    if analisis:
-        chart_df = pd.DataFrame(
-            {"Precio": analisis["valores"]},
-            index=pd.to_datetime(analisis["fechas"]),
-        )
-        st.line_chart(chart_df, height=180)
+    con_dato = [c for c, _r in commodities if c in COMMODITY_AV_FUNCTION]
+    sin_dato = [c for c, _r in commodities if c not in COMMODITY_AV_FUNCTION]
 
-        mcol1, mcol2, mcol3 = st.columns(3)
-        mcol1.metric("Precio actual", f"{analisis['actual']:.2f}")
-        mcol2.metric("Promedio 12m", f"{analisis['promedio_12m']:.2f}")
-        mcol3.metric(
-            "Proyeccion 3m (regresion lineal)",
-            f"{analisis['proyeccion_3m']:.2f}",
-            f"{analisis['tendencia_pct']:+.1f}%",
-        )
-
-        veredicto, motivo = recomendacion_compra(analisis)
-        color_map = {
-            "Comprar ahora": ("#eaf3de", "#27500a"),
-            "Esperar": ("#faeeda", "#854f0b"),
-            "Buscar alternativas / negociar": ("#fcebeb", "#791f1f"),
-            "Proceder segun cronograma": ("#f1efe8", "#5f5e5a"),
-        }
-        bg, txt = color_map.get(veredicto, ("#f1efe8", "#5f5e5a"))
-        st.markdown(
-            f"<div style='background:{bg};color:{txt};border-radius:8px;padding:10px 14px;"
-            f"margin:8px 0;font-size:13px;'><strong>{veredicto}</strong><br>{motivo}</div>",
-            unsafe_allow_html=True,
-        )
-    else:
+    if sin_dato:
         st.caption(
-            "No se pudo obtener el historico de este commodity en este momento (limite diario "
-            "de la API gratuita o dato no disponible)."
+            f"Sin indice de materia prima directo y gratuito para: {', '.join(sin_dato)}. "
+            "Se muestra como driver relevante pero sin precio en vivo."
+        )
+
+    analisis_principal = None
+    for commodity_actual in con_dato[:2]:  # maximo 2 para cuidar el limite diario de la API
+        serie_commodity = av_commodity_series(commodity_actual)
+        analisis = regresion_lineal_commodity(serie_commodity) if serie_commodity else None
+        if commodity_actual == commodity:
+            analisis_principal = analisis
+
+        if len(con_dato) > 1:
+            st.markdown(f"_{commodity_actual}_")
+
+        if analisis:
+            chart_df = pd.DataFrame(
+                {"Precio": analisis["valores"]},
+                index=pd.to_datetime(analisis["fechas"]),
+            )
+            st.line_chart(chart_df, height=160)
+
+            mcol1, mcol2, mcol3 = st.columns(3)
+            mcol1.metric("Precio actual", f"{analisis['actual']:.2f}")
+            mcol2.metric("Promedio 12m", f"{analisis['promedio_12m']:.2f}")
+            mcol3.metric(
+                "Proyeccion 3m (regresion lineal)",
+                f"{analisis['proyeccion_3m']:.2f}",
+                f"{analisis['tendencia_pct']:+.1f}%",
+            )
+
+            veredicto, motivo = recomendacion_compra(analisis)
+            color_map = {
+                "Comprar ahora": ("#eaf3de", "#27500a"),
+                "Esperar": ("#faeeda", "#854f0b"),
+                "Buscar alternativas / negociar": ("#fcebeb", "#791f1f"),
+                "Proceder segun cronograma": ("#f1efe8", "#5f5e5a"),
+            }
+            bg, txt = color_map.get(veredicto, ("#f1efe8", "#5f5e5a"))
+            st.markdown(
+                f"<div style='background:{bg};color:{txt};border-radius:8px;padding:10px 14px;"
+                f"margin:8px 0;font-size:13px;'><strong>{veredicto}</strong><br>{motivo}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption(
+                f"No se pudo obtener el historico de {commodity_actual} en este momento (limite "
+                "diario de la API gratuita o dato no disponible)."
+            )
+
+    if not con_dato:
+        st.caption(
+            "Ninguno de los commodities detectados tiene un indice directo gratuito disponible."
         )
 
     # --- Mano de obra ----------------------------------------------------------
@@ -510,6 +764,247 @@ def render_riesgo_mercado(row) -> None:
         st.caption("Sin referencia de mano de obra para este pais (indicador orientativo, no en tiempo real).")
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def resolver_pais_info(pais_texto: str):
+    """Empareja un pais escrito en texto libre (ej. 'Alemania') contra
+    COUNTRY_INFO sin importar mayusculas/acentos. Regresa (nombre_normalizado,
+    info_o_None)."""
+    if not pais_texto:
+        return "", None
+    pais_norm = _normaliza_busqueda(pais_texto)
+    for nombre, info in COUNTRY_INFO.items():
+        if _normaliza_busqueda(nombre) in pais_norm or pais_norm in _normaliza_busqueda(nombre):
+            return nombre, info
+    return pais_texto, None
+
+
+def _campo_html(label: str, valor: str) -> str:
+    return (
+        "<div style='margin-bottom:8px;'>"
+        f"<div style='font-size:11px;color:#9a988f;text-transform:uppercase;letter-spacing:.02em;'>{label}</div>"
+        f"<div style='font-size:13.5px;color:#1a1a17;'>{valor or 'No especificado'}</div>"
+        "</div>"
+    )
+
+
+def render_reporte_nueva_solicitud(titulo: str, descripcion: str) -> None:
+    """Version 'app' del reporte de riesgo de mercado que antes se le pedia a
+    un agente de Copilot: mismo formato (Identificacion / Drivers / Commodity
+    / Inflacion / Tipo de cambio / Riesgo economico / Impacto / Insight /
+    Recomendaciones / Resumen ejecutivo / Decision sugerida), pero con datos
+    reales de Alpha Vantage, Banxico y Banco Mundial en vez de que un modelo
+    de lenguaje adivine cifras que no puede verificar. Todo lo que no se
+    encuentra en el texto se marca como 'No especificado', nunca se inventa."""
+
+    texto_completo = f"{titulo}\n{descripcion}"
+    datos = parsear_descripcion_libre(descripcion)
+    commodities, es_generico = detectar_commodities(texto_completo)
+    commodity_principal = commodities[0][0]
+
+    pais_texto = datos["pais"]
+    pais_norm, info_pais = resolver_pais_info(pais_texto)
+    moneda_cot = datos["moneda_cotizacion"] or datos["moneda_monto"]
+    moneda_presup = datos["moneda_presupuesto"]
+    monto = datos["monto"]
+    moneda_monto = datos["moneda_monto"] or moneda_cot
+
+    # --- Identificacion -----------------------------------------------------
+    st.markdown("#### Identificación")
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    with ic1:
+        st.markdown(_campo_html("Proyecto", titulo), unsafe_allow_html=True)
+        st.markdown(_campo_html("Proveedor", datos["proveedor"]), unsafe_allow_html=True)
+    with ic2:
+        st.markdown(_campo_html("País", pais_texto), unsafe_allow_html=True)
+        st.markdown(
+            _campo_html("Monto", f"{monto:,.0f} {moneda_monto}" if monto else ""),
+            unsafe_allow_html=True,
+        )
+    with ic3:
+        st.markdown(_campo_html("Moneda cotización", moneda_cot), unsafe_allow_html=True)
+        st.markdown(_campo_html("Moneda presupuesto", moneda_presup), unsafe_allow_html=True)
+    with ic4:
+        st.markdown(_campo_html("Compra estimada", datos["fecha_compra"]), unsafe_allow_html=True)
+        st.markdown(_campo_html("Entrega requerida", datos["fecha_entrega"]), unsafe_allow_html=True)
+
+    # --- Drivers / commodities -----------------------------------------------
+    st.markdown("#### Drivers de costo")
+    filas_drivers = ""
+    for c, relevancia in commodities:
+        tiene_dato = "con dato en vivo" if c in COMMODITY_AV_FUNCTION else "sin indice directo gratuito"
+        filas_drivers += (
+            "<tr>"
+            f"<td style='padding:4px 10px;font-size:13px;'>{c}</td>"
+            f"<td style='padding:4px 10px;'>{badge_riesgo_html('Alto' if relevancia == 'Alta' else ('Medio' if relevancia == 'Media' else 'Bajo'))}</td>"
+            f"<td style='padding:4px 10px;font-size:12.5px;color:#5f5e5a;'>Detectado en la descripción ({tiene_dato}).</td>"
+            "</tr>"
+        )
+    st.markdown(
+        "<table style='width:100%;border-collapse:collapse;'>"
+        "<tr style='color:#9a988f;font-size:11px;text-transform:uppercase;'>"
+        "<td style='padding:4px 10px;'>Commodity</td><td style='padding:4px 10px;'>Relevancia</td>"
+        "<td style='padding:4px 10px;'>Justificación</td></tr>" + filas_drivers + "</table>",
+        unsafe_allow_html=True,
+    )
+    if es_generico:
+        st.caption("No se detectaron palabras clave especificas; se uso Cobre como referencia generica.")
+
+    # --- Commodity: historico + regresion -------------------------------------
+    st.markdown("#### Commodity")
+    con_dato = [c for c, _r in commodities if c in COMMODITY_AV_FUNCTION]
+    analisis_principal = None
+    riesgo_commodity = "Medio"
+    for c in con_dato[:2]:
+        serie = av_commodity_series(c)
+        analisis = regresion_lineal_commodity(serie) if serie else None
+        if c == commodity_principal:
+            analisis_principal = analisis
+            riesgo_commodity = clasificar_riesgo_commodity(analisis) if analisis else "Medio"
+        if len(con_dato) > 1:
+            st.markdown(f"_{c}_")
+        if analisis:
+            chart_df = pd.DataFrame({"Precio": analisis["valores"]}, index=pd.to_datetime(analisis["fechas"]))
+            st.line_chart(chart_df, height=150)
+            mcol1, mcol2, mcol3 = st.columns(3)
+            mcol1.metric("Precio actual", f"{analisis['actual']:.2f}")
+            mcol2.metric("Promedio 12m", f"{analisis['promedio_12m']:.2f}")
+            mcol3.metric("Proyección 3m", f"{analisis['proyeccion_3m']:.2f}", f"{analisis['tendencia_pct']:+.1f}%")
+        else:
+            st.caption(f"No se pudo obtener el histórico de {c} en este momento.")
+    if not con_dato:
+        st.caption("Ninguno de los commodities detectados tiene índice directo gratuito disponible.")
+    st.markdown(f"Riesgo commodity: {badge_riesgo_html(riesgo_commodity)}", unsafe_allow_html=True)
+
+    # --- Inflacion --------------------------------------------------------------
+    st.markdown("#### Inflación")
+    wb_mexico = world_bank_inflation("MEX")
+    icol1, icol2 = st.columns(2)
+    with icol1:
+        if wb_mexico:
+            st.metric(f"México ({wb_mexico['anio']})", f"{wb_mexico['valor']:.2f}%")
+        else:
+            st.caption("Inflación México no disponible en este momento.")
+    riesgo_inflacion = clasificar_riesgo_inflacion(wb_mexico["valor"] if wb_mexico else None)
+    if pais_norm and pais_norm != "México" and info_pais:
+        wb_pais = world_bank_inflation(info_pais["wb_code"])
+        with icol2:
+            if wb_pais:
+                st.metric(f"{pais_norm} ({wb_pais['anio']})", f"{wb_pais['valor']:.2f}%")
+            else:
+                st.caption(f"Inflación {pais_norm} no disponible en este momento.")
+        if wb_pais:
+            riesgo_inflacion = combinar_riesgo([riesgo_inflacion, clasificar_riesgo_inflacion(wb_pais["valor"])])
+    elif pais_texto:
+        with icol2:
+            st.caption(f"'{pais_texto}' no esta en el catalogo de paises configurado; agregalo a COUNTRY_INFO para inflacion automatica.")
+    st.markdown(f"Riesgo inflación: {badge_riesgo_html(riesgo_inflacion)}", unsafe_allow_html=True)
+
+    # --- Tipo de cambio -----------------------------------------------------
+    st.markdown("#### Tipo de cambio")
+    hay_exposicion = bool(moneda_cot and moneda_presup and moneda_cot != moneda_presup)
+    fx = av_fx_rate(moneda_cot, moneda_presup) if hay_exposicion else None
+    if not moneda_cot or not moneda_presup:
+        st.caption("Falta moneda de cotización o moneda de presupuesto en la descripción para calcular exposición.")
+        riesgo_cambiario = "Medio"
+    elif not hay_exposicion:
+        st.caption(f"Cotización y presupuesto en la misma moneda ({moneda_cot}) — sin riesgo cambiario directo.")
+        riesgo_cambiario = "Bajo"
+    else:
+        riesgo_cambiario = clasificar_riesgo_cambiario(True, datos["con_cobertura"])
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            if fx:
+                st.metric(f"{moneda_cot}/{moneda_presup}", f"{fx['rate']:.4f}")
+            else:
+                st.caption("No se pudo obtener el tipo de cambio en este momento.")
+        with fcol2:
+            if fx and monto:
+                st.metric(f"Valor de referencia ({moneda_presup})", f"{monto * fx['rate']:,.0f}")
+        if datos["pagos"]:
+            cal = " · ".join(f"{p['pct']}% {p['momento']}" for p in datos["pagos"])
+            st.caption(f"Calendario de exposición: {cal}.")
+        st.caption(
+            "Con cobertura cambiaria mencionada en la descripción." if datos["con_cobertura"]
+            else "Sin cobertura cambiaria — la exposición queda abierta hasta cada pago."
+        )
+    st.markdown(f"Riesgo cambiario: {badge_riesgo_html(riesgo_cambiario)}", unsafe_allow_html=True)
+
+    # --- Riesgo economico -----------------------------------------------------
+    st.markdown("#### Riesgo económico")
+    riesgo_mercado = combinar_riesgo([riesgo_commodity, riesgo_inflacion, riesgo_cambiario])
+    riesgo_real = riesgo_mercado
+    if datos["con_cobertura"] and RIESGO_NIVEL_RANK.get(riesgo_real, 2) > 1:
+        niveles_orden = ["Bajo", "Medio", "Medio-Alto", "Alto"]
+        riesgo_real = niveles_orden[niveles_orden.index(riesgo_real) - 1]
+    riesgo_total = combinar_riesgo([riesgo_mercado, riesgo_real])
+    rcol1, rcol2, rcol3 = st.columns(3)
+    rcol1.markdown(f"Riesgo de mercado<br>{badge_riesgo_html(riesgo_mercado)}", unsafe_allow_html=True)
+    rcol2.markdown(f"Riesgo real<br>{badge_riesgo_html(riesgo_real)}", unsafe_allow_html=True)
+    rcol3.markdown(f"Riesgo total<br>{badge_riesgo_html(riesgo_total)}", unsafe_allow_html=True)
+
+    # --- Impacto --------------------------------------------------------------
+    st.markdown("#### Impacto potencial")
+    if fx and monto:
+        st.caption(
+            f"Valor de referencia hoy: {monto * fx['rate']:,.0f} {moneda_presup}. El monto final "
+            "depende de la variacion del tipo de cambio y del commodity antes de cada pago; no se "
+            "calcula un impacto exacto sin una formula de ajuste o cobertura definida en el contrato."
+        )
+    else:
+        st.caption("Pendiente de calcular: faltan datos de monto y/o tipo de cambio verificables.")
+
+    # --- Insight ----------------------------------------------------------------
+    st.markdown("#### Insight")
+    riesgos_dict = {"Commodity": riesgo_commodity, "Inflación": riesgo_inflacion, "Tipo de cambio": riesgo_cambiario}
+    factor_principal = max(riesgos_dict, key=lambda k: RIESGO_NIVEL_RANK.get(riesgos_dict[k], 2))
+    st.markdown(
+        f"El factor de mayor riesgo para esta compra es **{factor_principal.lower()}** "
+        f"({badge_riesgo_html(riesgos_dict[factor_principal])}). Commodity principal: {commodity_principal}. "
+        + ("No hay cobertura cambiaria mencionada, así que el presupuesto queda expuesto hasta el último pago. "
+           if hay_exposicion and not datos["con_cobertura"] else "")
+        + "Compras debe vigilar esta variable antes de emitir la orden.",
+        unsafe_allow_html=True,
+    )
+
+    # --- Recomendaciones ----------------------------------------------------
+    st.markdown("#### Recomendaciones")
+    recs = []
+    if riesgo_cambiario in ("Alto", "Medio-Alto") and not datos["con_cobertura"]:
+        recs.append("Evaluar cobertura cambiaria antes de emitir la orden de compra.")
+    if riesgo_commodity in ("Alto", "Medio-Alto"):
+        recs.append(f"Negociar precio fijo o tope máximo de ajuste por {commodity_principal.lower()} y otras materias primas.")
+    if datos["vigencia"] and datos["fecha_compra"]:
+        recs.append("Confirmar que la vigencia de la cotización cubra la fecha de compra estimada; si no, negociar extensión.")
+    if datos["pagos"]:
+        recs.append("Dar seguimiento mensual al tipo de cambio hasta el último pago programado.")
+    if not recs:
+        recs.append("Sin señales de riesgo relevante; proceder según cronograma normal.")
+    st.markdown("<br>".join(f"• {r}" for r in recs), unsafe_allow_html=True)
+
+    # --- Decision sugerida ------------------------------------------------------
+    st.markdown("#### Decisión sugerida")
+    if not pais_texto and not moneda_cot:
+        decision = "Requiere más información"
+    elif riesgo_cambiario in ("Alto",) and not datos["con_cobertura"]:
+        decision = "Solicitar cobertura"
+    elif riesgo_total in ("Alto", "Medio-Alto"):
+        decision = "Negociar y monitorear"
+    elif analisis_principal and analisis_principal["tendencia_pct"] > 5:
+        decision = "Comprar ahora"
+    elif analisis_principal and analisis_principal["tendencia_pct"] < -5:
+        decision = "Esperar"
+    else:
+        decision = "Negociar y monitorear"
+    st.markdown(
+        f"<div style='background:#f1efe8;border-radius:8px;padding:10px 14px;font-size:13.5px;'>"
+        f"<strong>{decision}</strong></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Fuentes: Alpha Vantage (commodities/tipo de cambio, vía IMF/FRED), Banco Mundial "
+        "(inflación), Banxico SIE (inflación México si hay token configurado)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +1023,9 @@ def load_data():
         df = pd.read_csv("sample_expediente.csv")
         fuente = "demo"
     df = df.fillna("")
+    # El Sheet tiene filas extra en blanco (reservadas para los desplegables
+    # de Pais Proveedor / Commodity / Moneda); se descartan aqui para que no
+    # cuenten como proyectos fantasma en el dashboard.
     df["ID Proyecto"] = df["ID Proyecto"].astype(str).str.strip()
     df = df[df["ID Proyecto"] != ""].reset_index(drop=True)
     return df, fuente, datetime.now()
@@ -851,6 +1349,89 @@ def render_importador_requisiciones(df_actual: pd.DataFrame) -> pd.DataFrame:
         )
 
     return df_actual
+
+
+def render_nueva_solicitud(df_actual: pd.DataFrame) -> None:
+    st.subheader("Nueva solicitud")
+    st.caption(
+        "Pega el título y la descripción de la solicitud (proveedor, país, monedas, monto, "
+        "fechas, condiciones de pago si los tienes). La app detecta sola los commodities "
+        "relevantes y arma el análisis de mercado con datos reales — no hace falta llenar "
+        "país/moneda/commodity a mano ni pasarlo por un agente aparte."
+    )
+
+    col_id, col_tit = st.columns([1, 3])
+    with col_id:
+        id_proyecto = st.text_input("ID Proyecto", placeholder="CX-2026-...", key="nueva_sol_id")
+    with col_tit:
+        titulo = st.text_input("Título", placeholder="Compra de generador eléctrico industrial...", key="nueva_sol_titulo")
+
+    descripcion = st.text_area(
+        "Descripción",
+        height=180,
+        placeholder=(
+            "Proveedor: ...\nPaís de fabricación: ...\nMoneda de cotización: ...\n"
+            "Moneda presupuestal: ...\nMonto cotizado: ...\nFecha de cotización: ...\n"
+            "Compra estimada: ...\nEntrega requerida: ...\nCondiciones de pago: ..."
+        ),
+        key="nueva_sol_descripcion",
+    )
+
+    if st.button("Analizar", type="primary", key="nueva_sol_analizar"):
+        st.session_state["nueva_sol_analizada"] = True
+
+    if not st.session_state.get("nueva_sol_analizada") or not (titulo or descripcion):
+        return
+
+    st.markdown("---")
+    render_reporte_nueva_solicitud(titulo, descripcion)
+
+    st.markdown("---")
+    st.markdown("##### Guardar como expediente")
+    st.caption(
+        "Genera el renglón con país/moneda/commodity ya detectados, listo para pegar al Google "
+        "Sheet (mismo mecanismo que 'Importar requisición') — así queda guardado como memoria "
+        "del proyecto sin volver a capturarlo a mano."
+    )
+
+    datos = parsear_descripcion_libre(descripcion)
+    commodities, _ = detectar_commodities(f"{titulo}\n{descripcion}")
+    pais_norm, _ = resolver_pais_info(datos["pais"])
+
+    expediente = {
+        "ID Proyecto": id_proyecto or "",
+        "Nombre del Proyecto": titulo,
+        "Responsable": "",
+        "Riesgo": "",
+        "Ahorro Estimado": "",
+        "Próxima Acción": "Confirmar viabilidad y alternativas (paso 1).",
+        "Última Actualización": date.today().strftime("%Y-%m-%d"),
+        "Descripción": descripcion,
+        "País Proveedor": pais_norm or datos["pais"],
+        "Commodity Relacionado": commodities[0][0] if commodities else "",
+        "Moneda Cotización": datos["moneda_cotizacion"] or datos["moneda_monto"],
+    }
+    for n in range(1, 7):
+        for col in ETAPA_CHECKS[n]:
+            expediente[col] = False
+        expediente[ETAPA_NOTA_COL[n]] = ""
+
+    cols_sheet = list(dict.fromkeys(list(df_actual.columns) + list(expediente.keys())))
+    salida = pd.DataFrame([expediente]).reindex(columns=cols_sheet).fillna("")
+
+    st.download_button(
+        "Descargar renglón para pegar al Google Sheet",
+        data=salida.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"expediente_{id_proyecto or 'nuevo'}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="descargar_nueva_solicitud",
+    )
+    if "Descripción" not in df_actual.columns:
+        st.caption(
+            "Nota: agrega la columna 'Descripción' al Google Sheet para que quede guardado el "
+            "texto completo (hoy se pierde al pegar si esa columna no existe todavia)."
+        )
 
 
 def aplica_expediente_temporal(df_actual: pd.DataFrame) -> pd.DataFrame:
@@ -1193,8 +1774,8 @@ if df.empty:
     st.warning("No hay proyectos cargados todavia.")
     st.stop()
 
-tab_resumen, tab_roadmap, tab_importar = st.tabs(
-    ["Resumen general", "Roadmap por proyecto", "Importar requisición"]
+tab_resumen, tab_roadmap, tab_nueva, tab_importar = st.tabs(
+    ["Resumen general", "Roadmap por proyecto", "Nueva solicitud", "Importar requisición"]
 )
 
 with tab_resumen:
@@ -1206,6 +1787,9 @@ with tab_roadmap:
     idx = proyectos[proyectos == seleccion].index[0]
     row = df.loc[idx]
     render_roadmap(row)
+
+with tab_nueva:
+    render_nueva_solicitud(df)
 
 with tab_importar:
     render_importador_requisiciones(df)
