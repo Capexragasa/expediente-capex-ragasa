@@ -47,6 +47,12 @@ GOOGLE_SHEET_EDIT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit
 # manual en Microsoft 365, esta app no lo puede hacer por ti.
 AGENTE_CAPEX_URL = "https://m365.cloud.microsoft/chat/?titleId=T_9bb37296-de18-3b4d-fc79-4a2610bf843a"
 
+# Link directo al agente "CAPEX Market & Risk Intelligence" en M365 Copilot
+# (el que analiza commodities/tipo de cambio/inflacion). Mismo requisito que
+# el de arriba: tiene que estar compartido desde Agent Builder para que el
+# jefe o un junior lo puedan abrir sin permisos de edicion.
+COMMODITY_AGENT_URL = "https://m365.cloud.microsoft/chat/?titleId=T_4acf91d3-d628-e995-f9dc-3a75d993bb64"
+
 # Los 3 formularios de precalificacion en Jotform, uno por tipo de proveedor.
 # Se muestran los 3 en la etapa de Precalificacion para que se elija el
 # correcto segun el proveedor y se copie/comparta ese link con el.
@@ -580,7 +586,9 @@ def render_riesgo_mercado(row) -> None:
         "&#128225; Riesgos de mercado antes de cotizar: commodities, tipo de cambio e inflacion</p>"
         "<p style='font-size:11.5px;color:#9a988f;margin:0 0 10px;line-height:1.4;'>"
         "Insight automatico previo al paso 5: commodity del proyecto, tipo de cambio, inflacion "
-        "y mano de obra del pais del proveedor.</p>",
+        "y mano de obra del pais del proveedor.</p>"
+        f"<a href='{COMMODITY_AGENT_URL}' target='_blank' "
+        "style='font-size:13px;text-decoration:none;'>Abrir Agente CAPEX Market &amp; Risk Intelligence &#8599;</a>",
         unsafe_allow_html=True,
     )
 
@@ -1004,6 +1012,11 @@ def render_reporte_nueva_solicitud(titulo: str, descripcion: str) -> None:
     st.caption(
         "Fuentes: Alpha Vantage (commodities/tipo de cambio, vía IMF/FRED), Banco Mundial "
         "(inflación), Banxico SIE (inflación México si hay token configurado)."
+    )
+    st.markdown(
+        f"<a href='{COMMODITY_AGENT_URL}' target='_blank' "
+        "style='font-size:13px;text-decoration:none;'>Abrir Agente CAPEX Market &amp; Risk Intelligence &#8599;</a>",
+        unsafe_allow_html=True,
     )
 
 
