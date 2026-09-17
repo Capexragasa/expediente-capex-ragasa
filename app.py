@@ -171,6 +171,53 @@ ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 BANXICO_TOKEN = _get_secret("BANXICO_TOKEN", "")
 BANXICO_SERIE_INPC = "SP1"  # INPC general
 
+# URL del Apps Script "puente" (Extensiones > Apps Script, en el propio Sheet,
+# implementado como aplicacion web) que permite ESCRIBIR en el Sheet: marcar
+# checks solos y guardar nuevas solicitudes sin copiar/pegar CSV a mano.
+# Configuralo en Settings -> Secrets como APPS_SCRIPT_URL y APPS_SCRIPT_TOKEN
+# (el token debe ser EXACTAMENTE igual al definido dentro del script). Si no
+# esta configurado, la app sigue funcionando normal, solo en modo lectura
+# para esa parte (se siguen pudiendo descargar CSVs para pegar a mano).
+APPS_SCRIPT_URL = _get_secret("APPS_SCRIPT_URL", "")
+APPS_SCRIPT_TOKEN = _get_secret("APPS_SCRIPT_TOKEN", "")
+
+
+def escribir_en_sheet(payload: dict, timeout: int = 15):
+    """POST generico al Apps Script puente. Devuelve (ok, info).
+
+    Nunca truena la app: si no hay URL configurada o la llamada falla (Sheet
+    no disponible, token incorrecto, etc.), regresa ok=False con un mensaje
+    claro para mostrar en la UI, en vez de lanzar una excepcion."""
+    if not APPS_SCRIPT_URL:
+        return False, "Escritura automática no configurada (falta APPS_SCRIPT_URL en Secrets)."
+    body = dict(payload)
+    body["token"] = APPS_SCRIPT_TOKEN
+    try:
+        r = requests.post(APPS_SCRIPT_URL, json=body, timeout=timeout)
+        data = r.json()
+        if data.get("ok"):
+            return True, data
+        return False, data.get("error", "Error desconocido al escribir en el Sheet.")
+    except Exception as e:
+        return False, f"No se pudo conectar con el Sheet: {e}"
+
+
+def marcar_check_sheet(id_proyecto: str, columna: str, valor: bool):
+    return escribir_en_sheet(
+        {"accion": "marcar_check", "idProyecto": id_proyecto, "columna": columna, "valor": valor}
+    )
+
+
+def actualizar_campo_sheet(id_proyecto: str, columna: str, valor):
+    return escribir_en_sheet(
+        {"accion": "actualizar_campo", "idProyecto": id_proyecto, "columna": columna, "valor": valor}
+    )
+
+
+def agregar_fila_sheet(datos: dict):
+    return escribir_en_sheet({"accion": "agregar_fila", "datos": datos})
+
+
 COUNTRY_INFO = {
     "México": {"moneda": "MXN", "wb_code": "MEX"},
     "Estados Unidos": {"moneda": "USD", "wb_code": "USA"},
@@ -637,6 +684,13 @@ def render_riesgo_mercado(row) -> None:
 
     info_pais = COUNTRY_INFO.get(pais_proveedor)
 
+    # Estas 3 variables alimentan el "Riesgo global (automatico)" del final de
+    # este modulo: se van llenando con datos reales conforme se calculan las
+    # secciones de abajo (tipo de cambio / inflacion / commodity).
+    riesgo_cambiario_calc = clasificar_riesgo_cambiario(bool(pais_proveedor) and pais_proveedor != "México")
+    riesgo_inflacion_calc = "Medio"
+    riesgo_commodity_calc = "Medio"
+
     # --- Tipo de cambio -----------------------------------------------------
     st.markdown("**Tipo de cambio**")
     if pais_proveedor == "México":
@@ -677,6 +731,7 @@ def render_riesgo_mercado(row) -> None:
             inflacion_yoy = (serie_inpc[-1][1] / serie_inpc[0][1] - 1) * 100
             st.metric("Inflacion Mexico (INPC, interanual)", f"{inflacion_yoy:.1f}%")
             st.caption("Fuente: Banxico SIE.")
+            riesgo_inflacion_calc = clasificar_riesgo_inflacion(inflacion_yoy)
         else:
             wb = world_bank_inflation("MEX")
             if wb:
@@ -685,6 +740,7 @@ def render_riesgo_mercado(row) -> None:
                     "Fuente: Banco Mundial (agrega tu token de Banxico en Secrets como "
                     "BANXICO_TOKEN para el dato interanual mas reciente)."
                 )
+                riesgo_inflacion_calc = clasificar_riesgo_inflacion(wb["valor"])
             else:
                 st.caption("No se pudo obtener la inflacion de Mexico en este momento.")
     elif info_pais:
@@ -692,6 +748,7 @@ def render_riesgo_mercado(row) -> None:
         if wb:
             st.metric(f"Inflacion {pais_proveedor} ({wb['anio']})", f"{wb['valor']:.1f}%")
             st.caption("Fuente: Banco Mundial.")
+            riesgo_inflacion_calc = clasificar_riesgo_inflacion(wb["valor"])
         else:
             st.caption(f"No se pudo obtener la inflacion de {pais_proveedor} en este momento.")
     else:
@@ -763,6 +820,9 @@ def render_riesgo_mercado(row) -> None:
             "Ninguno de los commodities detectados tiene un indice directo gratuito disponible."
         )
 
+    if analisis_principal:
+        riesgo_commodity_calc = clasificar_riesgo_commodity(analisis_principal)
+
     # --- Mano de obra ----------------------------------------------------------
     st.markdown("**Referencia de mano de obra (proveedor)**")
     ref_mano_obra = LABOR_COST_REF.get(pais_proveedor)
@@ -770,6 +830,39 @@ def render_riesgo_mercado(row) -> None:
         st.caption(f"{pais_proveedor}: {ref_mano_obra} (referencia orientativa, no en tiempo real).")
     else:
         st.caption("Sin referencia de mano de obra para este pais (indicador orientativo, no en tiempo real).")
+
+    # --- Riesgo global (automatico) + guardar el check solo ------------------
+    # Todo lo de aqui es 100% calculado por la app (nada de juicio humano), asi
+    # que el check "E4 Riesgo global calculado" se puede marcar solo con un
+    # clic en vez de tener que ir a marcarlo a mano en el Sheet.
+    riesgo_total_calc = combinar_riesgo([riesgo_commodity_calc, riesgo_inflacion_calc, riesgo_cambiario_calc])
+    st.markdown("**Riesgo global (automático)**")
+    st.markdown(badge_riesgo_html(riesgo_total_calc), unsafe_allow_html=True)
+
+    id_proyecto_actual = str(row.get("ID Proyecto", "")).strip()
+    if not APPS_SCRIPT_URL:
+        st.caption(
+            "Para que este check se marque solo en el Sheet, configura APPS_SCRIPT_URL y "
+            "APPS_SCRIPT_TOKEN en Secrets (ver apps_script_capex.gs)."
+        )
+    elif id_proyecto_actual:
+        if st.button(
+            "Marcar 'Riesgo global calculado' y guardar en el Sheet",
+            key=f"guardar_riesgo_{id_proyecto_actual}",
+        ):
+            # El dropdown de "Riesgo" en el Sheet solo acepta Alto/Medio/Bajo;
+            # Medio-Alto se sube a Alto para no romper esa validacion.
+            riesgo_dropdown = "Alto" if riesgo_total_calc in ("Alto", "Medio-Alto") else riesgo_total_calc
+            ok_check, msg_check = marcar_check_sheet(id_proyecto_actual, "E4 Riesgo global calculado", True)
+            if ok_check:
+                actualizar_campo_sheet(id_proyecto_actual, "Riesgo", riesgo_dropdown)
+                st.success(
+                    "Guardado: el check 'Riesgo global calculado' ya quedó marcado en el Sheet "
+                    f"(riesgo {riesgo_dropdown.lower()})."
+                )
+                st.cache_data.clear()
+            else:
+                st.error(f"No se pudo guardar en el Sheet: {msg_check}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1348,18 +1441,50 @@ def render_importador_requisiciones(df_actual: pd.DataFrame) -> pd.DataFrame:
 
         st.success(f"{len(expedientes)} expediente(s) preparado(s).")
 
-        st.download_button(
-            "Descargar CSV listo para pegar al Google Sheet",
-            data=salida.to_csv(index=False).encode("utf-8-sig"),
-            file_name="expedientes_capex_importar.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="descargar_lote_importacion",
-        )
-
-        st.caption(
-            "Este archivo ya sale con las mismas columnas y en el mismo orden que tu Google Sheet actual."
-        )
+        if APPS_SCRIPT_URL:
+            icol1, icol2 = st.columns(2)
+            with icol1:
+                guardar_lote_directo = st.button(
+                    f"Guardar {len(expedientes)} directo en el Sheet",
+                    type="primary",
+                    use_container_width=True,
+                    key="guardar_lote_directo",
+                )
+            with icol2:
+                st.download_button(
+                    "Descargar CSV (respaldo)",
+                    data=salida.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="expedientes_capex_importar.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="descargar_lote_importacion",
+                )
+            if guardar_lote_directo:
+                exitos, fallos = 0, []
+                for exp in expedientes:
+                    ok, msg = agregar_fila_sheet(exp)
+                    if ok:
+                        exitos += 1
+                    else:
+                        fallos.append(f"{exp.get('ID Proyecto', '?')}: {msg}")
+                if exitos:
+                    st.success(f"{exitos} de {len(expedientes)} expediente(s) guardados directo en el Sheet.")
+                    st.cache_data.clear()
+                if fallos:
+                    st.error("No se pudieron guardar: " + "; ".join(fallos))
+        else:
+            st.download_button(
+                "Descargar CSV listo para pegar al Google Sheet",
+                data=salida.to_csv(index=False).encode("utf-8-sig"),
+                file_name="expedientes_capex_importar.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="descargar_lote_importacion",
+            )
+            st.caption(
+                "Este archivo ya sale con las mismas columnas y en el mismo orden que tu Google Sheet actual. "
+                "Configura APPS_SCRIPT_URL en Secrets para guardar con un clic, sin CSV."
+            )
 
     return df_actual
 
@@ -1432,14 +1557,49 @@ def render_nueva_solicitud(df_actual: pd.DataFrame) -> None:
     cols_sheet = list(dict.fromkeys(list(df_actual.columns) + list(expediente.keys())))
     salida = pd.DataFrame([expediente]).reindex(columns=cols_sheet).fillna("")
 
-    st.download_button(
-        "Descargar renglón para pegar al Google Sheet",
-        data=salida.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"expediente_{id_proyecto or 'nuevo'}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="descargar_nueva_solicitud",
-    )
+    if APPS_SCRIPT_URL:
+        gcol1, gcol2 = st.columns(2)
+        with gcol1:
+            guardar_directo = st.button(
+                "Guardar directo en el Sheet",
+                type="primary",
+                use_container_width=True,
+                key="guardar_directo_nueva_solicitud",
+                disabled=not id_proyecto,
+                help=None if id_proyecto else "Captura un ID Proyecto para poder guardar.",
+            )
+        with gcol2:
+            st.download_button(
+                "Descargar CSV (respaldo)",
+                data=salida.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"expediente_{id_proyecto or 'nuevo'}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="descargar_nueva_solicitud",
+            )
+        if guardar_directo:
+            ok, msg = agregar_fila_sheet(expediente)
+            if ok:
+                st.success(
+                    f"Guardado: '{id_proyecto}' ya quedó agregado al Sheet como fila nueva. "
+                    "Aparecerá en Roadmap en cuanto refresques los datos."
+                )
+                st.cache_data.clear()
+            else:
+                st.error(f"No se pudo guardar directo en el Sheet: {msg}. Usa el CSV de respaldo mientras tanto.")
+    else:
+        st.download_button(
+            "Descargar renglón para pegar al Google Sheet",
+            data=salida.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"expediente_{id_proyecto or 'nuevo'}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="descargar_nueva_solicitud",
+        )
+        st.caption(
+            "Para guardar con un clic (sin CSV), configura APPS_SCRIPT_URL y APPS_SCRIPT_TOKEN "
+            "en Secrets (ver apps_script_capex.gs)."
+        )
     if "Descripción" not in df_actual.columns:
         st.caption(
             "Nota: agrega la columna 'Descripción' al Google Sheet para que quede guardado el "
